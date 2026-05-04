@@ -8,8 +8,7 @@ import { LeadModule } from './lead/lead.module';
 import { PbxModule } from './pbx/pbx.module';
 import { VoiceAgentModule } from './voice-agent/voice-agent.module';
 import { AriModule } from './ari/ari.module';
-import { Customer, CustomerSchema } from './voice/Schema/customer.schema';
-import { DashboardModule } from './dashboard/dashboard.module';
+import { Customer, CustomerSchema } from './voice/schemas/customer.schema';
 
 @Module({
   imports: [
@@ -33,8 +32,7 @@ import { DashboardModule } from './dashboard/dashboard.module';
     LeadModule,
     PbxModule,
     VoiceAgentModule,
-    AriModule,
-    DashboardModule,
+    // AriModule,
   ],
 })
 export class AppModule {}

@@ -192,21 +192,21 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
 
     let aiInstructions = this.getDefaultAiInstructions();
 
-    try {
-      const voiceContext = await this.voiceService.handleIncomingCall({
-        call_id: callId,
-        caller_number: callerNumber,
-        called_number: calledNumber,
-      });
+    // try {
+    //   const voiceContext = await this.voiceService.handleIncomingCall({
+    //     call_id: callId,
+    //     caller_number: callerNumber,
+    //     called_number: calledNumber,
+    //   });
 
-      if (voiceContext?.success) {
-        this.logger.log(`Voice Service session created for call=${callId}`);
-      }
-    } catch (error) {
-      this.logger.warn(
-        `Failed to create Voice Service session for ${callId}: ${(error as Error).message}`,
-      );
-    }
+    //   if (voiceContext?.success) {
+    //     this.logger.log(`Voice Service session created for call=${callId}`);
+    //   }
+    // } catch (error) {
+    //   this.logger.warn(
+    //     `Failed to create Voice Service session for ${callId}: ${(error as Error).message}`,
+    //   );
+    // }
 
     try {
       this.logger.log(`[${callId}] Step 1: Answering channel ${channelId}`);
