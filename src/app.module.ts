@@ -9,6 +9,7 @@ import { PbxModule } from './pbx/pbx.module';
 import { VoiceAgentModule } from './voice-agent/voice-agent.module';
 import { AriModule } from './ari/ari.module';
 import { Customer, CustomerSchema } from './voice/Schema/customer.schema';
+import { DashboardModule } from './dashboard/dashboard.module';
 
 @Module({
   imports: [
@@ -33,6 +34,7 @@ import { Customer, CustomerSchema } from './voice/Schema/customer.schema';
     PbxModule,
     VoiceAgentModule,
     AriModule,
+    DashboardModule,
   ],
 })
 export class AppModule {}

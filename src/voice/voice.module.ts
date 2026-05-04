@@ -1,18 +1,17 @@
 import { Module } from '@nestjs/common';
 import { MongooseModule } from '@nestjs/mongoose';
-import { VoiceController } from './voice.controller';
-import { VoiceService } from './voice.service';
 import { VoiceGateway } from './voice.gateway';
-import { Customer, CustomerSchema } from './Schema/customer.schema';
+import { VoiceService } from './voice.service';
+import { VoiceController } from './voice.controller';
+import { Lead, LeadSchema } from './schemas/lead.schema';
+import { ActiveCampaignService } from '../integrations/active-campaign.service';
 
 @Module({
   imports: [
-    MongooseModule.forFeature([
-      { name: Customer.name, schema: CustomerSchema },
-    ]),
+    MongooseModule.forFeature([{ name: Lead.name, schema: LeadSchema }]),
   ],
+  providers: [VoiceGateway, VoiceService, ActiveCampaignService],
   controllers: [VoiceController],
-  providers: [VoiceService, VoiceGateway],
   exports: [VoiceService],
 })
 export class VoiceModule {}

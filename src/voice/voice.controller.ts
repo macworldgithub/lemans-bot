@@ -1,11 +1,12 @@
-import { Controller } from '@nestjs/common';
-import { VoiceService } from './voice.service';
+import { Controller, Get } from '@nestjs/common';
 
 @Controller('voice')
 export class VoiceController {
-  constructor(private voiceService: VoiceService) {}
+  // Voice agent operates entirely via WebSocket (Socket.IO gateway).
+  // This controller exposes only a health check for ops/monitoring.
 
-  // The voice agent now operates entirely via WebSocket (Socket.IO gateway).
-  // REST endpoints are no longer needed for the realtime flow.
-  // Keeping this controller as a placeholder for potential future REST APIs.
+  @Get('health')
+  health() {
+    return { status: 'healthy', timestamp: new Date().toISOString() };
+  }
 }

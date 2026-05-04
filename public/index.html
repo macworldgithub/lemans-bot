@@ -1,492 +1,420 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Voice Agent - Virtual Assistant</title>
-    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600&display=swap" rel="stylesheet">
-    <style>
-        :root {
-            --primary: #6366f1;
-            --primary-hover: #4f46e5;
-            --bg: #0f172a;
-            --card-bg: rgba(30, 41, 59, 0.7);
-            --text: #f8fafc;
-            --text-muted: #94a3b8;
-            --success: #22c55e;
-            --danger: #ef4444;
-        }
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>LeMans Entertainment — AI Receptionist Demo</title>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --red: #e11d48;
+      --red-dark: #be123c;
+      --bg: #0a0a0a;
+      --card: rgba(20, 20, 20, 0.9);
+      --border: rgba(255,255,255,0.08);
+      --text: #f8fafc;
+      --muted: #71717a;
+      --green: #22c55e;
+      --yellow: #eab308;
+    }
+    * { margin:0; padding:0; box-sizing:border-box; font-family:'Outfit',sans-serif; }
+    body {
+      background: var(--bg);
+      background-image:
+        radial-gradient(at 20% 10%, rgba(225,29,72,0.12) 0, transparent 55%),
+        radial-gradient(at 80% 90%, rgba(225,29,72,0.08) 0, transparent 55%);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+    }
+    .header {
+      text-align: center;
+      margin-bottom: 32px;
+    }
+    .logo {
+      font-size: 1.5rem;
+      font-weight: 700;
+      letter-spacing: -0.5px;
+    }
+    .logo span { color: var(--red); }
+    .tagline { color: var(--muted); font-size: 0.85rem; margin-top: 4px; }
 
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-            font-family: 'Outfit', sans-serif;
-        }
+    .card {
+      width: 100%;
+      max-width: 520px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 36px;
+      backdrop-filter: blur(16px);
+      box-shadow: 0 32px 64px -16px rgba(0,0,0,0.6);
+    }
 
-        body {
-            background-color: var(--bg);
-            background-image: 
-                radial-gradient(at 0% 0%, rgba(99, 102, 241, 0.15) 0, transparent 50%),
-                radial-gradient(at 100% 100%, rgba(168, 85, 247, 0.15) 0, transparent 50%);
-            color: var(--text);
-            min-height: 100vh;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            padding: 20px;
-        }
+    /* Orb */
+    .orb-wrap {
+      display: flex;
+      justify-content: center;
+      margin-bottom: 32px;
+    }
+    .orb {
+      width: 110px;
+      height: 110px;
+      border-radius: 50%;
+      background: var(--red);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      position: relative;
+      box-shadow: 0 0 24px rgba(225,29,72,0.35);
+      transition: all 0.4s ease;
+    }
+    .orb::after {
+      content: '';
+      position: absolute;
+      inset: 0;
+      border-radius: 50%;
+      border: 2px solid var(--red);
+      animation: pulse 2.4s ease-out infinite;
+    }
+    @keyframes pulse {
+      0%   { transform: scale(1); opacity: 0.7; }
+      100% { transform: scale(1.65); opacity: 0; }
+    }
+    .orb.listening { background: var(--green); box-shadow: 0 0 28px rgba(34,197,94,0.45); }
+    .orb.listening::after { border-color: var(--green); }
+    .orb.speaking { background: var(--yellow); box-shadow: 0 0 28px rgba(234,179,8,0.45); }
+    .orb.speaking::after { border-color: var(--yellow); animation-duration: 1s; }
+    .orb svg { width: 38px; height: 38px; fill: white; }
 
-        .container {
-            width: 100%;
-            max-width: 500px;
-            background: var(--card-bg);
-            backdrop-filter: blur(12px);
-            border: 1px solid rgba(255, 255, 255, 0.1);
-            border-radius: 24px;
-            padding: 40px;
-            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
-            text-align: center;
-            transition: transform 0.3s ease;
-        }
+    /* Status */
+    .status-row {
+      display: flex;
+      justify-content: center;
+      margin-bottom: 28px;
+    }
+    .badge {
+      padding: 5px 14px;
+      border-radius: 20px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      letter-spacing: 0.3px;
+      background: rgba(225,29,72,0.15);
+      color: #fb7185;
+      border: 1px solid rgba(225,29,72,0.25);
+      transition: all 0.3s;
+    }
+    .badge.connected {
+      background: rgba(34,197,94,0.12);
+      color: var(--green);
+      border-color: rgba(34,197,94,0.25);
+    }
+    .badge.speaking-badge {
+      background: rgba(234,179,8,0.12);
+      color: var(--yellow);
+      border-color: rgba(234,179,8,0.25);
+    }
 
-        h1 {
-            font-size: 2rem;
-            margin-bottom: 8px;
-            background: linear-gradient(to right, #818cf8, #c084fc);
-            -webkit-background-clip: text;
-            background-clip: text;
-            -webkit-text-fill-color: transparent;
-        }
+    /* Buttons */
+    .controls { display: flex; flex-direction: column; gap: 12px; }
+    button {
+      padding: 14px;
+      border-radius: 12px;
+      border: none;
+      font-size: 0.95rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s;
+      letter-spacing: 0.1px;
+    }
+    .btn-start {
+      background: var(--red);
+      color: white;
+    }
+    .btn-start:hover { background: var(--red-dark); transform: translateY(-1px); }
+    .btn-start:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+    .btn-end {
+      background: rgba(255,255,255,0.07);
+      color: var(--text);
+      border: 1px solid var(--border);
+    }
+    .btn-end:hover { background: rgba(255,255,255,0.12); }
 
-        .subtitle {
-            color: var(--text-muted);
-            margin-bottom: 40px;
-            font-size: 0.9rem;
-        }
+    /* Transcript panels */
+    .panels { margin-top: 24px; display: flex; flex-direction: column; gap: 10px; }
+    .panel-label {
+      font-size: 0.68rem;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      color: var(--muted);
+      margin-bottom: 4px;
+    }
+    .panel {
+      padding: 14px 16px;
+      border-radius: 10px;
+      background: rgba(255,255,255,0.04);
+      font-size: 0.875rem;
+      line-height: 1.55;
+      color: var(--muted);
+      min-height: 44px;
+      border: 1px solid var(--border);
+    }
+    .panel.agent { border-left: 3px solid var(--red); }
+    .panel.user  { border-left: 3px solid #818cf8; }
+    .panel .active { color: var(--text); }
 
-        .status-orb {
-            width: 120px;
-            height: 120px;
-            margin: 0 auto 40px;
-            border-radius: 50%;
-            background: var(--primary);
-            position: relative;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            box-shadow: 0 0 20px rgba(99, 102, 241, 0.3);
-            transition: all 0.5s ease;
-        }
+    /* Lead / Transfer notification */
+    .notification {
+      margin-top: 16px;
+      padding: 14px 16px;
+      border-radius: 10px;
+      font-size: 0.85rem;
+      line-height: 1.5;
+      display: none;
+    }
+    .notification.lead {
+      background: rgba(34,197,94,0.08);
+      border: 1px solid rgba(34,197,94,0.25);
+      color: var(--green);
+    }
+    .notification.transfer {
+      background: rgba(234,179,8,0.08);
+      border: 1px solid rgba(234,179,8,0.25);
+      color: var(--yellow);
+    }
 
-        .status-orb::after {
-            content: '';
-            position: absolute;
-            width: 100%;
-            height: 100%;
-            border-radius: 50%;
-            border: 2px solid var(--primary);
-            animation: pulse 2s infinite;
-        }
-
-        @keyframes pulse {
-            0% { transform: scale(1); opacity: 1; }
-            100% { transform: scale(1.5); opacity: 0; }
-        }
-
-        .status-orb.listening {
-            background: var(--success);
-            box-shadow: 0 0 30px rgba(34, 197, 94, 0.5);
-        }
-
-        .status-orb.listening::after {
-            border-color: var(--success);
-        }
-
-        .status-orb.speaking {
-            background: #a855f7;
-            box-shadow: 0 0 30px rgba(168, 85, 247, 0.5);
-        }
-
-        .status-orb.speaking::after {
-            border-color: #a855f7;
-            animation: pulse 1s infinite;
-        }
-
-        .controls {
-            display: flex;
-            flex-direction: column;
-            gap: 16px;
-        }
-
-        button {
-            padding: 14px 28px;
-            border-radius: 12px;
-            border: none;
-            font-weight: 600;
-            cursor: pointer;
-            transition: all 0.2s ease;
-            font-size: 1rem;
-        }
-
-        .btn-primary {
-            background: var(--primary);
-            color: white;
-        }
-
-        .btn-primary:hover {
-            background: var(--primary-hover);
-            transform: translateY(-2px);
-        }
-
-        .btn-danger {
-            background: var(--danger);
-            color: white;
-        }
-
-        .btn-danger:hover {
-            background: #dc2626;
-            transform: translateY(-2px);
-        }
-
-        #transcript, #agent-text {
-            margin-top: 20px;
-            padding: 16px;
-            border-radius: 12px;
-            background: rgba(0, 0, 0, 0.2);
-            font-size: 0.9rem;
-            min-height: 50px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            color: var(--text-muted);
-            line-height: 1.5;
-        }
-
-        #agent-text {
-            border-left: 3px solid var(--primary);
-            text-align: left;
-        }
-
-        .label {
-            font-size: 0.7rem;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-            color: var(--text-muted);
-            margin-top: 20px;
-            margin-bottom: 4px;
-        }
-
-        .active-text {
-            color: var(--text);
-        }
-
-        .mic-icon {
-            width: 40px;
-            height: 40px;
-            fill: white;
-        }
-
-        .hidden { display: none; }
-
-        .status-badge {
-            display: inline-block;
-            padding: 4px 12px;
-            border-radius: 20px;
-            font-size: 0.75rem;
-            font-weight: 600;
-            margin-bottom: 16px;
-            background: rgba(99, 102, 241, 0.2);
-            color: #818cf8;
-        }
-
-        .status-badge.active {
-            background: rgba(34, 197, 94, 0.2);
-            color: var(--success);
-        }
-
-        .booking-saved {
-            margin-top: 20px;
-            padding: 16px;
-            border-radius: 12px;
-            background: rgba(34, 197, 94, 0.1);
-            border: 1px solid rgba(34, 197, 94, 0.3);
-            color: var(--success);
-            font-size: 0.85rem;
-        }
-    </style>
+    .hidden { display: none !important; }
+  </style>
 </head>
 <body>
-    <div class="container">
-        <h1>Voice Assistant</h1>
-        <p class="subtitle">AI-Powered Service Booking Agent</p>
-        
-        <div id="status-badge" class="status-badge">Ready</div>
 
-        <div id="orb" class="status-orb">
-            <svg class="mic-icon" viewBox="0 0 24 24">
-                <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/>
-                <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/>
-            </svg>
-        </div>
+<div class="header">
+  <div class="logo">Le<span>Mans</span> Entertainment</div>
+  <div class="tagline">AI Receptionist — POC Demo</div>
+</div>
 
-        <div class="controls">
-            <button id="start-btn" class="btn-primary">Start Conversation</button>
-            <button id="end-btn" class="btn-danger hidden">End Call</button>
-        </div>
-
-        <div class="label hidden" id="agent-label">Agent</div>
-        <div id="agent-text" class="hidden"></div>
-
-        <div class="label hidden" id="user-label">You</div>
-        <div id="transcript" class="hidden"></div>
-
-        <div id="booking-result" class="booking-saved hidden"></div>
+<div class="card">
+  <div class="orb-wrap">
+    <div class="orb" id="orb">
+      <svg viewBox="0 0 24 24"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/><path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/></svg>
     </div>
+  </div>
 
-    <script src="/socket.io/socket.io.js"></script>
-    <script>
-        const socket = io();
+  <div class="status-row">
+    <div class="badge" id="badge">Ready to connect</div>
+  </div>
 
-        // DOM elements
-        const orb = document.getElementById('orb');
-        const startBtn = document.getElementById('start-btn');
-        const endBtn = document.getElementById('end-btn');
-        const agentText = document.getElementById('agent-text');
-        const agentLabel = document.getElementById('agent-label');
-        const transcript = document.getElementById('transcript');
-        const userLabel = document.getElementById('user-label');
-        const statusBadge = document.getElementById('status-badge');
-        const bookingResult = document.getElementById('booking-result');
+  <div class="controls">
+    <button class="btn-start" id="startBtn">Start Demo Call</button>
+    <button class="btn-end hidden" id="endBtn">End Call</button>
+  </div>
 
-        let audioContext = null;
-        let mediaStream = null;
-        let workletNode = null;
-        let isSessionActive = false;
+  <div class="panels" id="panels" style="display:none">
+    <div>
+      <div class="panel-label">Alex (AI Receptionist)</div>
+      <div class="panel agent" id="agentPanel">Waiting...</div>
+    </div>
+    <div>
+      <div class="panel-label">You</div>
+      <div class="panel user" id="userPanel">...</div>
+    </div>
+  </div>
 
-        // ─── Audio Playback ───
-        let playbackQueue = [];
-        let isPlaying = false;
-        const CAPTURE_SAMPLE_RATE = 24000; // OpenAI expects 24kHz input
-        const PLAYBACK_SAMPLE_RATE = 16000; // ElevenLabs outputs 16kHz PCM
+  <div class="notification lead" id="leadNotif"></div>
+  <div class="notification transfer" id="transferNotif"></div>
+</div>
 
-        function setOrbState(state) {
-            orb.classList.remove('listening', 'speaking');
-            if (state) orb.classList.add(state);
-        }
+<script src="/socket.io/socket.io.js"></script>
+<script>
+  const socket = io();
 
-        function setStatus(text, active = false) {
-            statusBadge.textContent = text;
-            statusBadge.classList.toggle('active', active);
-        }
+  const orb        = document.getElementById('orb');
+  const badge      = document.getElementById('badge');
+  const startBtn   = document.getElementById('startBtn');
+  const endBtn     = document.getElementById('endBtn');
+  const panels     = document.getElementById('panels');
+  const agentPanel = document.getElementById('agentPanel');
+  const userPanel  = document.getElementById('userPanel');
+  const leadNotif  = document.getElementById('leadNotif');
+  const transferNotif = document.getElementById('transferNotif');
 
-        function queueAudioChunk(base64) {
-            // Decode base64 to PCM16 to Float32
-            const raw = atob(base64);
-            const bytes = new Uint8Array(raw.length);
-            for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
-            const pcm16 = new Int16Array(bytes.buffer);
-            const float32 = new Float32Array(pcm16.length);
-            for (let i = 0; i < pcm16.length; i++) float32[i] = pcm16[i] / 32768;
+  // ─── Audio ───────────────────────────────────────────────────────────────────
+  let audioCtx = null;
+  let mediaStream = null;
+  let workletNode = null;
+  let isActive = false;
 
-            playbackQueue.push(float32);
-            if (!isPlaying) playNextChunk();
-        }
+  let playQueue = [];
+  let playing = false;
+  const CAPTURE_SR  = 24000;
+  const PLAYBACK_SR = 16000;
 
-        function playNextChunk() {
-            if (playbackQueue.length === 0 || !audioContext) {
-                isPlaying = false;
-                setOrbState('listening');
-                setStatus('Listening...', true);
-                return;
+  function orbState(state) {
+    orb.classList.remove('listening', 'speaking');
+    if (state) orb.classList.add(state);
+  }
+
+  function setStatus(text, type = '') {
+    badge.textContent = text;
+    badge.className = 'badge' + (type ? ` ${type}` : '');
+  }
+
+  function enqueueAudio(b64) {
+    const raw = atob(b64);
+    const bytes = new Uint8Array(raw.length);
+    for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+    const pcm16 = new Int16Array(bytes.buffer);
+    const f32 = new Float32Array(pcm16.length);
+    for (let i = 0; i < pcm16.length; i++) f32[i] = pcm16[i] / 32768;
+    playQueue.push(f32);
+    if (!playing) playNext();
+  }
+
+  function playNext() {
+    if (!playQueue.length || !audioCtx) { playing = false; orbState('listening'); setStatus('Listening...', 'connected'); return; }
+    playing = true;
+    orbState('speaking');
+    setStatus('Alex is speaking...', 'speaking-badge');
+    const samples = playQueue.shift();
+    const buf = audioCtx.createBuffer(1, samples.length, PLAYBACK_SR);
+    buf.copyToChannel(samples, 0);
+    const src = audioCtx.createBufferSource();
+    src.buffer = buf;
+    src.connect(audioCtx.destination);
+    src.onended = playNext;
+    src.start();
+  }
+
+  function stopPlayback() {
+    playQueue = [];
+    playing = false;
+  }
+
+  async function startMic() {
+    audioCtx = new AudioContext({ sampleRate: CAPTURE_SR });
+    const code = `
+      class PCMProcessor extends AudioWorkletProcessor {
+        process(inputs) {
+          const ch = inputs[0]?.[0];
+          if (ch) {
+            const pcm = new Int16Array(ch.length);
+            for (let i = 0; i < ch.length; i++) {
+              const s = Math.max(-1, Math.min(1, ch[i]));
+              pcm[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
             }
-
-            isPlaying = true;
-            setOrbState('speaking');
-            setStatus('Agent speaking...', true);
-
-            const samples = playbackQueue.shift();
-            const buffer = audioContext.createBuffer(1, samples.length, PLAYBACK_SAMPLE_RATE);
-            buffer.copyToChannel(samples, 0);
-
-            const source = audioContext.createBufferSource();
-            source.buffer = buffer;
-            source.connect(audioContext.destination);
-            source.onended = () => playNextChunk();
-            source.start();
+            this.port.postMessage(pcm.buffer, [pcm.buffer]);
+          }
+          return true;
         }
+      }
+      registerProcessor('pcm-proc', PCMProcessor);
+    `;
+    const blob = new Blob([code], { type: 'application/javascript' });
+    const url = URL.createObjectURL(blob);
+    await audioCtx.audioWorklet.addModule(url);
+    URL.revokeObjectURL(url);
 
-        function stopPlayback() {
-            playbackQueue = [];
-            isPlaying = false;
-        }
+    mediaStream = await navigator.mediaDevices.getUserMedia({
+      audio: { sampleRate: CAPTURE_SR, channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+    });
 
-        // ─── Microphone Capture (AudioWorklet for PCM16 @ 24kHz) ───
-        async function startMicrophone() {
-            audioContext = new AudioContext({ sampleRate: CAPTURE_SAMPLE_RATE });
+    const src = audioCtx.createMediaStreamSource(mediaStream);
+    workletNode = new AudioWorkletNode(audioCtx, 'pcm-proc');
+    workletNode.port.onmessage = (e) => {
+      if (!isActive) return;
+      const bytes = new Uint8Array(e.data);
+      let bin = '';
+      for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+      socket.emit('audio-chunk', { audio: btoa(bin) });
+    };
+    src.connect(workletNode);
+    workletNode.connect(audioCtx.destination);
+  }
 
-            // Register inline AudioWorklet processor
-            const processorCode = `
-                class PCMProcessor extends AudioWorkletProcessor {
-                    process(inputs) {
-                        const input = inputs[0];
-                        if (input && input[0]) {
-                            const float32 = input[0];
-                            const pcm16 = new Int16Array(float32.length);
-                            for (let i = 0; i < float32.length; i++) {
-                                const s = Math.max(-1, Math.min(1, float32[i]));
-                                pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-                            }
-                            this.port.postMessage(pcm16.buffer, [pcm16.buffer]);
-                        }
-                        return true;
-                    }
-                }
-                registerProcessor('pcm-processor', PCMProcessor);
-            `;
-            const blob = new Blob([processorCode], { type: 'application/javascript' });
-            const url = URL.createObjectURL(blob);
-            await audioContext.audioWorklet.addModule(url);
-            URL.revokeObjectURL(url);
+  function stopMic() {
+    workletNode?.disconnect(); workletNode = null;
+    mediaStream?.getTracks().forEach(t => t.stop()); mediaStream = null;
+    audioCtx?.close(); audioCtx = null;
+  }
 
-            mediaStream = await navigator.mediaDevices.getUserMedia({
-                audio: {
-                    sampleRate: CAPTURE_SAMPLE_RATE,
-                    channelCount: 1,
-                    echoCancellation: true,
-                    noiseSuppression: true,
-                    autoGainControl: true,
-                }
-            });
+  // ─── Socket events ───────────────────────────────────────────────────────────
+  socket.on('session-started', () => {
+    setStatus('Connected — Listening...', 'connected');
+    orbState('listening');
+    panels.style.display = 'flex';
+  });
 
-            const source = audioContext.createMediaStreamSource(mediaStream);
-            workletNode = new AudioWorkletNode(audioContext, 'pcm-processor');
+  socket.on('audio-delta', (d) => enqueueAudio(d.delta));
 
-            workletNode.port.onmessage = (e) => {
-                if (!isSessionActive) return;
+  let agentText = '';
+  socket.on('transcript-delta', (d) => {
+    agentText += d.delta;
+    agentPanel.innerHTML = `<span class="active">${agentText}</span>`;
+  });
+  socket.on('transcript-done', () => { agentText = ''; });
 
-                // Convert ArrayBuffer to base64
-                const pcm16 = new Uint8Array(e.data);
-                let binary = '';
-                for (let i = 0; i < pcm16.length; i++) {
-                    binary += String.fromCharCode(pcm16[i]);
-                }
-                const base64 = btoa(binary);
-                socket.emit('audio-chunk', { audio: base64 });
-            };
+  socket.on('user-transcript', (d) => {
+    userPanel.innerHTML = `<span class="active">${d.transcript}</span>`;
+  });
 
-            source.connect(workletNode);
-            workletNode.connect(audioContext.destination); // Required for worklet to run
-        }
+  socket.on('speech-started', () => {
+    stopPlayback();
+    orbState('listening');
+    setStatus('Listening...', 'connected');
+    agentText = '';
+  });
 
-        function stopMicrophone() {
-            if (workletNode) {
-                workletNode.disconnect();
-                workletNode = null;
-            }
-            if (mediaStream) {
-                mediaStream.getTracks().forEach(t => t.stop());
-                mediaStream = null;
-            }
-            if (audioContext) {
-                audioContext.close();
-                audioContext = null;
-            }
-        }
+  socket.on('lead-saved', (d) => {
+    leadNotif.style.display = 'block';
+    leadNotif.innerHTML = `✅ Lead saved — <strong>${d.caller_name}</strong> | ${d.event_type} | Synced to ActiveCampaign`;
+  });
 
-        // ─── Socket.IO Events ───
-        socket.on('connect', () => {
-            console.log('Connected to server');
-        });
+  socket.on('transfer-initiated', (d) => {
+    transferNotif.style.display = 'block';
+    transferNotif.innerHTML = `📞 Transferring <strong>${d.event_type}</strong> call → ${d.transfer_to}`;
+  });
 
-        socket.on('session-started', (data) => {
-            console.log('Session started:', data.sessionId);
-            setStatus('Connected — Listening...', true);
-            setOrbState('listening');
-        });
+  socket.on('realtime-error', (d) => {
+    setStatus('Error: ' + (d.error?.message ?? 'Unknown'));
+  });
 
-        socket.on('audio-delta', (data) => {
-            queueAudioChunk(data.delta);
-        });
+  socket.on('session-closed', () => endSession());
 
-        let currentAgentText = '';
-        socket.on('transcript-delta', (data) => {
-            agentLabel.classList.remove('hidden');
-            agentText.classList.remove('hidden');
-            currentAgentText += data.delta;
-            agentText.innerHTML = `<span class="active-text">${currentAgentText}</span>`;
-        });
+  // ─── Buttons ─────────────────────────────────────────────────────────────────
+  startBtn.onclick = async () => {
+    try {
+      startBtn.disabled = true;
+      setStatus('Connecting...');
+      await startMic();
+      isActive = true;
+      socket.emit('start-session');
+      startBtn.classList.add('hidden');
+      endBtn.classList.remove('hidden');
+    } catch (err) {
+      console.error(err);
+      setStatus('Mic access denied');
+      startBtn.disabled = false;
+    }
+  };
 
-        socket.on('transcript-done', (data) => {
-            currentAgentText = '';
-        });
+  endBtn.onclick = () => {
+    socket.emit('end-session');
+    endSession();
+  };
 
-        socket.on('user-transcript', (data) => {
-            userLabel.classList.remove('hidden');
-            transcript.classList.remove('hidden');
-            transcript.innerHTML = `<span class="active-text">${data.transcript}</span>`;
-        });
-
-        socket.on('speech-started', () => {
-            // User started speaking — interrupt agent audio (barge-in)
-            stopPlayback();
-            setOrbState('listening');
-            setStatus('Listening...', true);
-            currentAgentText = '';
-        });
-
-        socket.on('booking-saved', (data) => {
-            bookingResult.classList.remove('hidden');
-            bookingResult.innerHTML = `✅ Booking saved for <strong>${data.name}</strong><br>
-                Service: ${data.service_type} | Urgency: ${data.urgency}`;
-        });
-
-        socket.on('realtime-error', (data) => {
-            console.error('Realtime error:', data.error);
-            setStatus('Error: ' + (data.error?.message || 'Unknown'), false);
-        });
-
-        socket.on('session-closed', () => {
-            endSession();
-        });
-
-        // ─── Button Handlers ───
-        startBtn.onclick = async () => {
-            try {
-                startBtn.disabled = true;
-                setStatus('Connecting...', false);
-
-                await startMicrophone();
-                isSessionActive = true;
-
-                socket.emit('start-session');
-
-                startBtn.classList.add('hidden');
-                endBtn.classList.remove('hidden');
-            } catch (err) {
-                console.error('Failed to start:', err);
-                setStatus('Microphone access denied', false);
-                startBtn.disabled = false;
-            }
-        };
-
-        endBtn.onclick = () => {
-            socket.emit('end-session');
-            endSession();
-        };
-
-        function endSession() {
-            isSessionActive = false;
-            stopPlayback();
-            stopMicrophone();
-
-            startBtn.classList.remove('hidden');
-            startBtn.disabled = false;
-            endBtn.classList.add('hidden');
-            
-            setOrbState(null);
-            setStatus('Call ended', false);
-        }
-    </script>
+  function endSession() {
+    isActive = false;
+    stopPlayback();
+    stopMic();
+    startBtn.classList.remove('hidden');
+    startBtn.disabled = false;
+    endBtn.classList.add('hidden');
+    orbState(null);
+    setStatus('Call ended');
+  }
+</script>
 </body>
 </html>
