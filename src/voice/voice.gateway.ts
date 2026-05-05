@@ -252,7 +252,7 @@ export class VoiceGateway
     string,
     ReturnType<typeof setTimeout>
   >();
-  private readonly SILENCE_TIMEOUT_MS = 5_000;
+  private readonly SILENCE_TIMEOUT_MS = 15_000;
 
   constructor(private readonly voiceService: VoiceService) {}
 
