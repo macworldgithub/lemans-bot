@@ -7,8 +7,9 @@ import { TradieModule } from './tradie/tradie.module';
 import { LeadModule } from './lead/lead.module';
 import { PbxModule } from './pbx/pbx.module';
 import { VoiceAgentModule } from './voice-agent/voice-agent.module';
-import { AriModule } from './ari/ari.module';
+// import { AriModule } from './ari/ari.module';
 import { Customer, CustomerSchema } from './voice/schemas/customer.schema';
+import { DashboardModule } from './dashboard/dashboard.module';
 
 @Module({
   imports: [
@@ -32,6 +33,7 @@ import { Customer, CustomerSchema } from './voice/schemas/customer.schema';
     LeadModule,
     PbxModule,
     VoiceAgentModule,
+    DashboardModule
     // AriModule,
   ],
 })
