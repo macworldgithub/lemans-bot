@@ -249,12 +249,6 @@
 
   let playQueue = [];
   let playing = false;
-
-  // Track whether ElevenLabs has signalled it's done sending chunks for this
-  // turn. We only fire the silence-start signal to the server once the queue
-  // is also empty AND this flag is true — i.e. the bot has truly finished.
-  let elevenLabsDone = false;
-
   const CAPTURE_SR  = 24000;
   const PLAYBACK_SR = 16000;
 
@@ -280,39 +274,23 @@
   }
 
   function playNext() {
-    if (!playQueue.length || !audioCtx) {
-      // Queue is now empty — check whether ElevenLabs is also done sending
-      if (playing || elevenLabsDone) {
-        // Bot has fully finished speaking; tell the server to start the
-        // silence countdown now (not when ElevenLabs sent its last packet).
-        playing = false;
-        elevenLabsDone = false;
-        orbState('listening');
-        setStatus('Listening...', 'connected');
-        socket.emit('playback-done'); // ← server starts silence timer here
-      }
-      playing = false;
-      return;
-    }
-
+    if (!playQueue.length || !audioCtx) { playing = false; orbState('listening'); setStatus('Listening...', 'connected'); return; }
     playing = true;
     orbState('speaking');
     setStatus('Alex is speaking...', 'speaking-badge');
-
     const samples = playQueue.shift();
     const buf = audioCtx.createBuffer(1, samples.length, PLAYBACK_SR);
     buf.copyToChannel(samples, 0);
     const src = audioCtx.createBufferSource();
     src.buffer = buf;
     src.connect(audioCtx.destination);
-    src.onended = playNext; // recurse: plays next chunk or calls done logic above
+    src.onended = playNext;
     src.start();
   }
 
   function stopPlayback() {
     playQueue = [];
     playing = false;
-    elevenLabsDone = false;
   }
 
   async function startMic() {
@@ -370,21 +348,6 @@
   });
 
   socket.on('audio-delta', (d) => enqueueAudio(d.delta));
-
-  // ElevenLabs has finished streaming this turn's audio chunks.
-  // We set the flag but do NOT start the silence timer yet — playback
-  // may still be draining the queue.
-  socket.on('audio-done', () => {
-    elevenLabsDone = true;
-    // If the queue is already empty (all chunks played before this arrived),
-    // trigger the done logic immediately.
-    if (!playing && playQueue.length === 0) {
-      elevenLabsDone = false;
-      orbState('listening');
-      setStatus('Listening...', 'connected');
-      socket.emit('playback-done'); // ← server starts silence timer here
-    }
-  });
 
   let agentText = '';
   socket.on('transcript-delta', (d) => {

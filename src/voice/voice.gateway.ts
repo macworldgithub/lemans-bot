@@ -32,46 +32,40 @@
 //   private readonly prewarmTtlMs = 60_000;
 //   private readonly prewarmStates = new Map<string, PrewarmState>();
 
-//   // Silence timer per session: fires after agent audio finishes + 5 s of no speech
-//   private readonly silenceTimers = new Map<
-//     string,
-//     ReturnType<typeof setTimeout>
-//   >();
-//   private readonly SILENCE_TIMEOUT_MS = 5_000;
-
 //   constructor(private readonly voiceService: VoiceService) {}
 
-//   afterInit(_server: Server) {
-//     this.logger.log('LeMans Voice Gateway Initialized');
+//   afterInit(server: Server) {
+//     this.logger.log('Voice Gateway Initialized');
 //   }
 
 //   handleConnection(client: Socket) {
 //     this.logger.log(`Client connected: ${client.id}`);
+//     // Pre-warm the realtime session in the background so start is faster.
 //     void this.startPrewarm(client);
 //   }
 
 //   handleDisconnect(client: Socket) {
 //     this.logger.log(`Client disconnected: ${client.id}`);
 //     this.clearPrewarmState(client.id);
-//     this.clearSilenceTimer(client.id);
+//     // Clean up the Realtime session when the browser disconnects
 //     this.voiceService.closeSession(client.id);
 //   }
-
-//   // ─── Session lifecycle ────────────────────────────────────────────────────
 
 //   @SubscribeMessage('start-session')
 //   async handleStartSession(@ConnectedSocket() client: Socket) {
 //     const sessionId = client.id;
-//     this.logger.log(`[VoiceGateway] Starting session: ${sessionId}`);
+//     this.logger.log(`[VoiceGateway] Starting realtime session: ${sessionId}`);
 
 //     try {
 //       let state = this.prewarmStates.get(sessionId);
 
+//       // If no prewarm exists (or previous one already cleared), start one now.
 //       if (!state) {
 //         await this.startPrewarm(client);
 //         state = this.prewarmStates.get(sessionId);
 //       }
 
+//       // Reuse prewarmed session when available.
 //       if (state) {
 //         try {
 //           await state.promise;
@@ -82,20 +76,27 @@
 //             return;
 //           }
 //         } catch {
-//           // fall through
+//           // Fall back to direct creation below.
 //         }
+
 //         this.clearPrewarmState(sessionId);
 //       }
 
-//       // Fallback direct creation
+//       // Fallback path: create realtime session directly.
 //       await this.voiceService.createRealtimeSession(
 //         sessionId,
-//         this.buildEventForwarder(client),
+//         this.buildSessionEventForwarder(client),
 //       );
+
+//       // Tell the browser the session is ready
 //       client.emit('session-started', { sessionId });
+
+//       // Trigger the agent to greet the user
 //       this.voiceService.triggerGreeting(sessionId);
 //     } catch (err) {
-//       this.logger.error(`[VoiceGateway] Failed to start session: ${err.message}`);
+//       this.logger.error(
+//         `[VoiceGateway] Failed to start session: ${err.message}`,
+//       );
 //       client.emit('realtime-error', {
 //         error: { message: 'Failed to connect to AI service' },
 //       });
@@ -114,42 +115,20 @@
 //   handleEndSession(@ConnectedSocket() client: Socket) {
 //     this.logger.log(`[VoiceGateway] Ending session: ${client.id}`);
 //     this.clearPrewarmState(client.id);
-//     this.clearSilenceTimer(client.id);
 //     this.voiceService.closeSession(client.id);
 //     client.emit('session-closed', {});
 //   }
 
-//   // ─── Silence timer management ─────────────────────────────────────────────
-
-//   private startSilenceTimer(client: Socket): void {
-//     this.clearSilenceTimer(client.id);
-//     const timer = setTimeout(() => {
-//       this.logger.log(
-//         `[VoiceGateway] Silence timeout for ${client.id} — notifying service`,
-//       );
-//       this.voiceService.handleSilenceTimeout(client.id);
-//     }, this.SILENCE_TIMEOUT_MS);
-//     this.silenceTimers.set(client.id, timer);
-//   }
-
-//   private clearSilenceTimer(sessionId: string): void {
-//     const t = this.silenceTimers.get(sessionId);
-//     if (t) {
-//       clearTimeout(t);
-//       this.silenceTimers.delete(sessionId);
-//     }
-//   }
-
-//   // ─── Prewarm helpers ──────────────────────────────────────────────────────
-
 //   private async startPrewarm(client: Socket): Promise<void> {
 //     const sessionId = client.id;
 //     const existing = this.prewarmStates.get(sessionId);
-//     if (existing) return existing.promise;
+//     if (existing) {
+//       return existing.promise;
+//     }
 
 //     let state: PrewarmState;
 //     const promise = this.voiceService
-//       .createRealtimeSession(sessionId, this.buildEventForwarder(client))
+//       .createRealtimeSession(sessionId, this.buildSessionEventForwarder(client))
 //       .then(() => {
 //         state.ready = true;
 //         state.failed = false;
@@ -174,7 +153,13 @@
 //       this.voiceService.closeSession(sessionId);
 //     }, this.prewarmTtlMs);
 
-//     state = { promise, ready: false, failed: false, ttlTimer };
+//     state = {
+//       promise,
+//       ready: false,
+//       failed: false,
+//       ttlTimer,
+//     };
+
 //     this.prewarmStates.set(sessionId, state);
 //     return promise;
 //   }
@@ -186,19 +171,11 @@
 //     this.prewarmStates.delete(sessionId);
 //   }
 
-//   // ─── Event forwarder ──────────────────────────────────────────────────────
-
-//   private buildEventForwarder(client: Socket): (event: any) => void {
+//   private buildSessionEventForwarder(client: Socket): (event: any) => void {
 //     return (event: any) => {
 //       switch (event.type) {
 //         case 'audio-delta':
 //           client.emit('audio-delta', { delta: event.delta });
-//           break;
-
-//         case 'audio-done':
-//           // Agent finished speaking — start the silence countdown
-//           this.startSilenceTimer(client);
-//           client.emit('audio-done', {});
 //           break;
 
 //         case 'transcript-delta':
@@ -206,26 +183,23 @@
 //           break;
 
 //         case 'transcript-done':
-//           client.emit('transcript-done', { transcript: event.transcript });
+//           client.emit('transcript-done', {
+//             transcript: event.transcript,
+//           });
 //           break;
 
 //         case 'user-transcript':
-//           // User spoke — cancel silence timer
-//           this.clearSilenceTimer(client.id);
-//           client.emit('user-transcript', { transcript: event.transcript });
+//           client.emit('user-transcript', {
+//             transcript: event.transcript,
+//           });
 //           break;
 
 //         case 'speech-started':
-//           this.clearSilenceTimer(client.id);
 //           client.emit('speech-started', {});
 //           break;
 
-//         case 'transfer-initiated':
-//           client.emit('transfer-initiated', event.data);
-//           break;
-
-//         case 'lead-saved':
-//           client.emit('lead-saved', event.data);
+//         case 'booking-saved':
+//           client.emit('booking-saved', event.data);
 //           break;
 
 //         case 'error':
@@ -273,13 +247,12 @@ export class VoiceGateway
   private readonly prewarmTtlMs = 60_000;
   private readonly prewarmStates = new Map<string, PrewarmState>();
 
-  // Silence timer per session: fires after the CLIENT finishes playing all
-  // queued audio + SILENCE_TIMEOUT_MS of no speech detected.
+  // Silence timer per session: fires after agent audio finishes + 5 s of no speech
   private readonly silenceTimers = new Map<
     string,
     ReturnType<typeof setTimeout>
   >();
-  private readonly SILENCE_TIMEOUT_MS = 10_000;
+  private readonly SILENCE_TIMEOUT_MS = 5_000;
 
   constructor(private readonly voiceService: VoiceService) {}
 
@@ -361,20 +334,6 @@ export class VoiceGateway
     client.emit('session-closed', {});
   }
 
-  /**
-   * The client emits 'playback-done' once the Web Audio API has finished
-   * playing every queued PCM chunk AND ElevenLabs has signalled isFinal.
-   * This is the correct moment to start the silence countdown — the bot
-   * has genuinely stopped speaking from the caller's perspective.
-   */
-  @SubscribeMessage('playback-done')
-  handlePlaybackDone(@ConnectedSocket() client: Socket) {
-    this.logger.debug(
-      `[VoiceGateway] Playback done for ${client.id} — starting silence timer`,
-    );
-    this.startSilenceTimer(client);
-  }
-
   // ─── Silence timer management ─────────────────────────────────────────────
 
   private startSilenceTimer(client: Socket): void {
@@ -452,10 +411,8 @@ export class VoiceGateway
           break;
 
         case 'audio-done':
-          // Forward to client so it knows ElevenLabs is done streaming for
-          // this turn. The client will emit 'playback-done' back to us once
-          // the Web Audio queue has fully drained — that's when we start the
-          // silence timer (see handlePlaybackDone above).
+          // Agent finished speaking — start the silence countdown
+          this.startSilenceTimer(client);
           client.emit('audio-done', {});
           break;
 
@@ -468,13 +425,12 @@ export class VoiceGateway
           break;
 
         case 'user-transcript':
-          // User spoke — cancel silence timer immediately
+          // User spoke — cancel silence timer
           this.clearSilenceTimer(client.id);
           client.emit('user-transcript', { transcript: event.transcript });
           break;
 
         case 'speech-started':
-          // Barge-in detected — cancel silence timer immediately
           this.clearSilenceTimer(client.id);
           client.emit('speech-started', {});
           break;
