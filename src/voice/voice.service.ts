@@ -5404,6 +5404,15 @@ interface RealtimeSession {
   silenceRepromptCount: number;
   detectedEventType: EventType;
   callerNumber: string;
+
+  // ── Sentence-level stream buffering ──────────────────────────────────────
+  // Accumulates raw text deltas until a complete sentence boundary is reached.
+  sentenceAccumulator: string;
+  // Whether the stream-level done event has fired (signals flush everything).
+  streamDone: boolean;
+  // The active inactivity timer handle. ONLY set after a full sentence completes
+  // or the stream explicitly ends — never on partial chunks.
+  inactivityTimer: ReturnType<typeof setTimeout> | null;
 }
 
 interface FunctionCallPayload {
@@ -5411,6 +5420,15 @@ interface FunctionCallPayload {
   arguments: string;
   call_id: string;
 }
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+
+// Regex that matches a sentence-ending punctuation followed by whitespace OR
+// end-of-string.  Handles "Hello!" / "Ready?" / "Come on in. " / ellipsis, etc.
+const SENTENCE_END_RE = /[.!?]+(\s|$)/;
+
+// How long (ms) after the last completed sentence before the silence nudge fires.
+const INACTIVITY_TIMEOUT_MS = 6_000;
 
 // Transfer number map — populate from env or hardcode for POC
 const TRANSFER_NUMBERS: Record<EventType, string | null> = {
@@ -5449,15 +5467,150 @@ export class VoiceService {
     return { name: r.name, arguments: r.arguments, call_id: r.call_id };
   }
 
+  // ─── Sentence buffering helpers ──────────────────────────────────────────────
+
+  /**
+   * Appends an incoming text delta to the session's sentence accumulator and
+   * checks whether one or more complete sentences have formed.
+   *
+   * For every complete sentence found:
+   *   1. Flushes that sentence to ElevenLabs immediately.
+   *   2. Resets (re-arms) the inactivity timer.
+   *
+   * Any trailing partial text is kept in the accumulator for the next delta.
+   *
+   * @param sessionId  The active session identifier.
+   * @param delta      The raw text chunk arriving from OpenAI.
+   */
+  private processDelta(sessionId: string, delta: string): void {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+
+    session.sentenceAccumulator += delta;
+
+    // Extract all complete sentences from the accumulator.
+    // We scan for sentence-ending punctuation and slice off each finished
+    // sentence, leaving any incomplete trailing text for the next chunk.
+    let remaining = session.sentenceAccumulator;
+
+    while (true) {
+      const match = SENTENCE_END_RE.exec(remaining);
+      if (!match) break;
+
+      // Everything up to and including the punctuation (+ trailing space) is a
+      // complete sentence.
+      const endIdx = match.index + match[0].length;
+      const completeSentence = remaining.slice(0, endIdx);
+      remaining = remaining.slice(endIdx);
+
+      this.logger.debug(
+        `[${sessionId}] Sentence complete: "${completeSentence.trim()}"`,
+      );
+
+      // 1. Forward the completed sentence to ElevenLabs.
+      if (session.elevenLabsReady) {
+        this.sendTextToElevenLabs(sessionId, completeSentence);
+      } else {
+        session.textBuffer.push(completeSentence);
+      }
+
+      // 2. Arm the inactivity timer now that a full sentence has landed.
+      //    Any previously queued timer is cleared first so we always measure
+      //    from the *last* completed sentence, not from the first chunk.
+      this._armInactivityTimer(sessionId);
+    }
+
+    // Save whatever is left (incomplete sentence) for the next delta.
+    session.sentenceAccumulator = remaining;
+  }
+
+  /**
+   * Called when the OpenAI stream signals that the response is fully done
+   * (response.text.done).  Flushes any remaining buffered text that didn't end
+   * with punctuation (e.g. a final fragment like "Thanks!"), then arms the
+   * inactivity timer one last time.
+   */
+  private flushSentenceBuffer(sessionId: string, fullText: string): void {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+
+    const leftover = session.sentenceAccumulator.trim();
+    session.sentenceAccumulator = '';
+    session.streamDone = true;
+
+    if (leftover.length > 0) {
+      this.logger.debug(
+        `[${sessionId}] Flushing leftover fragment on stream-done: "${leftover}"`,
+      );
+      if (session.elevenLabsReady) {
+        this.sendTextToElevenLabs(sessionId, leftover);
+      } else {
+        session.textBuffer.push(leftover);
+      }
+    }
+
+    // Signal ElevenLabs that no more text is coming for this response.
+    this.flushElevenLabsStream(sessionId);
+
+    // Track the last full question for silence re-prompts.
+    if (fullText.trim()) {
+      session.lastQuestionAsked = fullText.trim();
+    }
+
+    // Arm the final inactivity timer after the full response has streamed out.
+    this._armInactivityTimer(sessionId);
+  }
+
+  // ─── Inactivity timer ────────────────────────────────────────────────────────
+
+  /**
+   * Arms (or re-arms) the 6-second inactivity timer.
+   * This is the ONLY place where the timer is started.
+   * It must never be called on a raw chunk — only after a sentence completes
+   * or the stream ends.
+   */
+  private _armInactivityTimer(sessionId: string): void {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+
+    // Clear any previously running timer so partial chunks can never stack.
+    if (session.inactivityTimer !== null) {
+      clearTimeout(session.inactivityTimer);
+      session.inactivityTimer = null;
+    }
+
+    session.inactivityTimer = setTimeout(() => {
+      session.inactivityTimer = null;
+      this.handleSilenceTimeout(sessionId);
+    }, INACTIVITY_TIMEOUT_MS);
+
+    this.logger.debug(
+      `[${sessionId}] Inactivity timer armed (${INACTIVITY_TIMEOUT_MS}ms)`,
+    );
+  }
+
+  /**
+   * Cancels the inactivity timer entirely.
+   * Called when the user starts speaking or the session is torn down.
+   */
+  private _cancelInactivityTimer(sessionId: string): void {
+    const session = this.sessions.get(sessionId);
+    if (!session || session.inactivityTimer === null) return;
+    clearTimeout(session.inactivityTimer);
+    session.inactivityTimer = null;
+    this.logger.debug(`[${sessionId}] Inactivity timer cancelled`);
+  }
+
   // ─── Silence handling ────────────────────────────────────────────────────────
 
   handleSilenceTimeout(sessionId: string): void {
     const session = this.sessions.get(sessionId);
     if (!session) return;
 
+    // Guard: don't nudge while a response is still streaming.
     if (session.isResponseActive) {
       this.logger.debug(
-        `[${sessionId}] Silence ignored — response still active`,
+        `[${sessionId}] Silence timeout fired but response still active — ignoring`,
       );
       return;
     }
@@ -5582,6 +5735,10 @@ export class VoiceService {
           silenceRepromptCount: 0,
           detectedEventType: 'unknown',
           callerNumber,
+          // ── Sentence buffering initial state ──
+          sentenceAccumulator: '',
+          streamDone: false,
+          inactivityTimer: null,
         });
 
         this.openElevenLabsStream(sessionId);
@@ -5607,6 +5764,7 @@ export class VoiceService {
         this.logger.log(
           `[${sessionId}] OpenAI WS closed: ${code} - ${reason}`,
         );
+        this._cancelInactivityTimer(sessionId);
         this.closeElevenLabsWs(sessionId);
         this.sessions.delete(sessionId);
         onEvent({ type: 'session-closed' });
@@ -5770,6 +5928,11 @@ export class VoiceService {
       case 'response.created':
         session.isResponseActive = true;
         session.silenceRepromptCount = 0;
+        // Reset sentence accumulator for this new response turn.
+        session.sentenceAccumulator = '';
+        session.streamDone = false;
+        // Cancel any pending inactivity timer — a new response is in flight.
+        this._cancelInactivityTimer(sessionId);
         if (!session.firstResponseCreatedAtMs) {
           session.firstResponseCreatedAtMs = Date.now();
         }
@@ -5788,25 +5951,53 @@ export class VoiceService {
         break;
       }
 
+      /**
+       * response.text.delta — a raw streaming chunk from OpenAI.
+       *
+       * BEFORE (broken): text was forwarded directly to ElevenLabs and the
+       *   transcript-delta event was emitted immediately, causing flush + timer
+       *   logic to fire on every tiny chunk.
+       *
+       * AFTER (fixed): the delta is fed into processDelta() which accumulates
+       *   it and only forwards complete sentences to ElevenLabs (and only then
+       *   arms the inactivity timer).  The transcript-delta event is still
+       *   emitted on every chunk so the UI can show real-time text — that part
+       *   is fine and expected.
+       */
       case 'response.text.delta':
-        if (session.elevenLabsReady) {
-          this.sendTextToElevenLabs(sessionId, event.delta);
-        } else {
-          session.textBuffer.push(event.delta);
-        }
+        // Route through the sentence buffer instead of forwarding raw chunks.
+        this.processDelta(sessionId, event.delta);
+        // UI transcript can still update on every delta — this is display only.
         session.onEvent({ type: 'transcript-delta', delta: event.delta });
         break;
 
+      /**
+       * response.text.done — OpenAI signals the full response text is complete.
+       *
+       * BEFORE (broken): flushElevenLabsStream() was called here, and
+       *   lastQuestionAsked was set here.  Any leftover fragment in the
+       *   accumulator was silently discarded, and the caller's silence timer
+       *   was not started at all.
+       *
+       * AFTER (fixed): flushSentenceBuffer() drains any leftover fragment,
+       *   calls flushElevenLabsStream(), sets lastQuestionAsked, and arms the
+       *   inactivity timer exactly once — all in the right order.
+       */
       case 'response.text.done':
-        if (typeof event.text === 'string' && event.text.trim()) {
-          session.lastQuestionAsked = event.text.trim();
-        }
-        this.flushElevenLabsStream(sessionId);
+        this.flushSentenceBuffer(sessionId, event.text ?? '');
         session.onEvent({ type: 'transcript-done', transcript: event.text });
         break;
 
+      /**
+       * input_audio_buffer.speech_started — user started speaking.
+       *
+       * Cancel the inactivity timer immediately so we never send a nudge while
+       * the user is already talking.
+       */
       case 'input_audio_buffer.speech_started':
         session.silenceRepromptCount = 0;
+        // Cancel silence timer — user is actively speaking.
+        this._cancelInactivityTimer(sessionId);
         if (session.isResponseActive) {
           try {
             session.ws.send(JSON.stringify({ type: 'response.cancel' }));
@@ -5814,6 +6005,9 @@ export class VoiceService {
             this.logger.warn(`[${sessionId}] Cancel failed: ${err.message}`);
           }
         }
+        // Reset sentence accumulator since we're interrupting the current turn.
+        session.sentenceAccumulator = '';
+        session.streamDone = false;
         this.closeElevenLabsWs(sessionId);
         this.openElevenLabsStream(sessionId, true);
         session.onEvent({ type: 'speech-started' });
@@ -5913,7 +6107,6 @@ export class VoiceService {
         transfer_to: transferTo,
       });
     } else {
-      // Transfer number not configured — fall back to lead capture
       this.logger.warn(
         `[${sessionId}] No transfer number for ${eventType} — saving lead instead`,
       );
@@ -5955,7 +6148,6 @@ export class VoiceService {
 
     this.logger.log(`[${sessionId}] Lead saved: ${lead._id}`);
 
-    // Push to ActiveCampaign
     try {
       await this.activeCampaign.createContact({
         firstName: args.caller_name,
@@ -6062,6 +6254,7 @@ export class VoiceService {
   closeSession(sessionId: string): void {
     const session = this.sessions.get(sessionId);
     if (session) {
+      this._cancelInactivityTimer(sessionId);
       this.closeElevenLabsWs(sessionId);
       try {
         session.ws.close();
