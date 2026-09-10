@@ -214,7 +214,8 @@
 
   <div class="panels" id="panels" style="display:none">
     <div>
-      <div class="panel-label">Alex (AI Receptionist)</div>
+      <!-- FIX: Updated agent name from Alex → Chloe -->
+      <div class="panel-label">Chloe (AI Receptionist)</div>
       <div class="panel agent" id="agentPanel">Waiting...</div>
     </div>
     <div>
@@ -231,33 +232,34 @@
 <script>
   const socket = io();
 
-  const orb        = document.getElementById('orb');
-  const badge      = document.getElementById('badge');
-  const startBtn   = document.getElementById('startBtn');
-  const endBtn     = document.getElementById('endBtn');
-  const panels     = document.getElementById('panels');
-  const agentPanel = document.getElementById('agentPanel');
-  const userPanel  = document.getElementById('userPanel');
-  const leadNotif  = document.getElementById('leadNotif');
+  const orb           = document.getElementById('orb');
+  const badge         = document.getElementById('badge');
+  const startBtn      = document.getElementById('startBtn');
+  const endBtn        = document.getElementById('endBtn');
+  const panels        = document.getElementById('panels');
+  const agentPanel    = document.getElementById('agentPanel');
+  const userPanel     = document.getElementById('userPanel');
+  const leadNotif     = document.getElementById('leadNotif');
   const transferNotif = document.getElementById('transferNotif');
 
   // ─── Audio ───────────────────────────────────────────────────────────────────
-  let audioCtx = null;
+  let audioCtx    = null;
   let mediaStream = null;
   let workletNode = null;
-  let isActive = false;
+  let isActive    = false;
 
   let playQueue = [];
-  let playing = false;
+  let playing   = false;
 
-  // Track whether ElevenLabs has signalled it's done sending chunks for this
-  // turn. We only fire the silence-start signal to the server once the queue
-  // is also empty AND this flag is true — i.e. the bot has truly finished.
+  // elevenLabsDone: true once the server fires 'audio-done' for this turn.
+  // We only tell the server playback is finished (via 'playback-done') once
+  // BOTH this flag is set AND the local play queue has drained.
   let elevenLabsDone = false;
 
   const CAPTURE_SR  = 24000;
   const PLAYBACK_SR = 16000;
 
+  // ─── Orb / badge helpers ─────────────────────────────────────────────────────
   function orbState(state) {
     orb.classList.remove('listening', 'speaking');
     if (state) orb.classList.add(state);
@@ -268,36 +270,36 @@
     badge.className = 'badge' + (type ? ` ${type}` : '');
   }
 
+  // ─── Audio playback queue ────────────────────────────────────────────────────
   function enqueueAudio(b64) {
-    const raw = atob(b64);
+    const raw   = atob(b64);
     const bytes = new Uint8Array(raw.length);
     for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
     const pcm16 = new Int16Array(bytes.buffer);
-    const f32 = new Float32Array(pcm16.length);
+    const f32   = new Float32Array(pcm16.length);
     for (let i = 0; i < pcm16.length; i++) f32[i] = pcm16[i] / 32768;
     playQueue.push(f32);
     if (!playing) playNext();
   }
 
   function playNext() {
+    // Queue drained — check whether ElevenLabs has also signalled it's done
     if (!playQueue.length || !audioCtx) {
-      // Queue is now empty — check whether ElevenLabs is also done sending
-      if (playing || elevenLabsDone) {
-        // Bot has fully finished speaking; tell the server to start the
-        // silence countdown now (not when ElevenLabs sent its last packet).
-        playing = false;
+      playing = false;
+      if (elevenLabsDone) {
+        // Both conditions met: queue empty + server finished sending.
+        // Signal the server so it can start the silence countdown.
         elevenLabsDone = false;
         orbState('listening');
         setStatus('Listening...', 'connected');
-        socket.emit('playback-done'); // ← server starts silence timer here
+        socket.emit('playback-done');
       }
-      playing = false;
       return;
     }
 
     playing = true;
     orbState('speaking');
-    setStatus('Alex is speaking...', 'speaking-badge');
+    setStatus('Chloe is speaking...', 'speaking-badge');
 
     const samples = playQueue.shift();
     const buf = audioCtx.createBuffer(1, samples.length, PLAYBACK_SR);
@@ -305,18 +307,21 @@
     const src = audioCtx.createBufferSource();
     src.buffer = buf;
     src.connect(audioCtx.destination);
-    src.onended = playNext; // recurse: plays next chunk or calls done logic above
+    // Recurse: plays next chunk or triggers done logic above
+    src.onended = playNext;
     src.start();
   }
 
   function stopPlayback() {
-    playQueue = [];
-    playing = false;
+    playQueue      = [];
+    playing        = false;
     elevenLabsDone = false;
   }
 
+  // ─── Microphone capture via AudioWorklet ─────────────────────────────────────
   async function startMic() {
     audioCtx = new AudioContext({ sampleRate: CAPTURE_SR });
+
     const code = `
       class PCMProcessor extends AudioWorkletProcessor {
         process(inputs) {
@@ -335,16 +340,22 @@
       registerProcessor('pcm-proc', PCMProcessor);
     `;
     const blob = new Blob([code], { type: 'application/javascript' });
-    const url = URL.createObjectURL(blob);
+    const url  = URL.createObjectURL(blob);
     await audioCtx.audioWorklet.addModule(url);
     URL.revokeObjectURL(url);
 
     mediaStream = await navigator.mediaDevices.getUserMedia({
-      audio: { sampleRate: CAPTURE_SR, channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+      audio: {
+        sampleRate: CAPTURE_SR,
+        channelCount: 1,
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      }
     });
 
-    const src = audioCtx.createMediaStreamSource(mediaStream);
-    workletNode = new AudioWorkletNode(audioCtx, 'pcm-proc');
+    const micSrc   = audioCtx.createMediaStreamSource(mediaStream);
+    workletNode    = new AudioWorkletNode(audioCtx, 'pcm-proc');
     workletNode.port.onmessage = (e) => {
       if (!isActive) return;
       const bytes = new Uint8Array(e.data);
@@ -352,51 +363,60 @@
       for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
       socket.emit('audio-chunk', { audio: btoa(bin) });
     };
-    src.connect(workletNode);
+    micSrc.connect(workletNode);
     workletNode.connect(audioCtx.destination);
   }
 
   function stopMic() {
-    workletNode?.disconnect(); workletNode = null;
-    mediaStream?.getTracks().forEach(t => t.stop()); mediaStream = null;
-    audioCtx?.close(); audioCtx = null;
+    workletNode?.disconnect();
+    workletNode = null;
+    mediaStream?.getTracks().forEach(t => t.stop());
+    mediaStream = null;
+    audioCtx?.close();
+    audioCtx = null;
   }
 
-  // ─── Socket events ───────────────────────────────────────────────────────────
+  // ─── Socket — incoming events ────────────────────────────────────────────────
+
   socket.on('session-started', () => {
     setStatus('Connected — Listening...', 'connected');
     orbState('listening');
     panels.style.display = 'flex';
   });
 
+  // Each audio chunk from ElevenLabs via the server
   socket.on('audio-delta', (d) => enqueueAudio(d.delta));
 
-  // ElevenLabs has finished streaming this turn's audio chunks.
-  // We set the flag but do NOT start the silence timer yet — playback
-  // may still be draining the queue.
+  // FIX: 'audio-done' — ElevenLabs has finished streaming for this turn.
+  // Don't trigger 'playback-done' immediately — the local queue may still
+  // be playing. Set the flag and let playNext() detect the right moment.
   socket.on('audio-done', () => {
     elevenLabsDone = true;
-    // If the queue is already empty (all chunks played before this arrived),
-    // trigger the done logic immediately.
+    // If playback already finished before this event arrived, fire now.
     if (!playing && playQueue.length === 0) {
       elevenLabsDone = false;
       orbState('listening');
       setStatus('Listening...', 'connected');
-      socket.emit('playback-done'); // ← server starts silence timer here
+      socket.emit('playback-done');
     }
   });
 
+  // Streaming transcript from OpenAI → text-to-speech pipeline
   let agentText = '';
   socket.on('transcript-delta', (d) => {
     agentText += d.delta;
     agentPanel.innerHTML = `<span class="active">${agentText}</span>`;
   });
-  socket.on('transcript-done', () => { agentText = ''; });
+  socket.on('transcript-done', () => {
+    agentText = '';
+  });
 
+  // User speech transcription (completed turn)
   socket.on('user-transcript', (d) => {
     userPanel.innerHTML = `<span class="active">${d.transcript}</span>`;
   });
 
+  // User interrupted — cancel current playback immediately
   socket.on('speech-started', () => {
     stopPlayback();
     orbState('listening');
@@ -404,14 +424,24 @@
     agentText = '';
   });
 
+  // FIX: 'lead-saved' — show green notification
   socket.on('lead-saved', (d) => {
     leadNotif.style.display = 'block';
-    leadNotif.innerHTML = `✅ Lead saved — <strong>${d.caller_name}</strong> | ${d.event_type} | Synced to ActiveCampaign`;
+    leadNotif.innerHTML =
+      `✅ Lead saved — <strong>${d.caller_name ?? 'Unknown'}</strong>` +
+      ` | ${d.event_type ?? ''}` +
+      ` | Synced to ActiveCampaign`;
   });
 
+  // FIX: 'transfer-initiated' — show yellow notification
+  // The server emits this as { type: 'transfer-initiated', data: { ... } }
+  // which the gateway must forward as socket.emit('transfer-initiated', data)
   socket.on('transfer-initiated', (d) => {
     transferNotif.style.display = 'block';
-    transferNotif.innerHTML = `📞 Transferring <strong>${d.event_type}</strong> call → ${d.transfer_to}`;
+    transferNotif.innerHTML =
+      `📞 Transferring <strong>${d.event_type ?? ''}</strong> call` +
+      ` → ${d.transfer_to ?? 'team'}` +
+      (d.caller_name ? ` (${d.caller_name})` : '');
   });
 
   socket.on('realtime-error', (d) => {
@@ -432,7 +462,7 @@
       endBtn.classList.remove('hidden');
     } catch (err) {
       console.error(err);
-      setStatus('Mic access denied');
+      setStatus('Mic access denied — check browser permissions');
       startBtn.disabled = false;
     }
   };
@@ -451,6 +481,8 @@
     endBtn.classList.add('hidden');
     orbState(null);
     setStatus('Call ended');
+    leadNotif.style.display     = 'none';
+    transferNotif.style.display = 'none';
   }
 </script>
 </body>
