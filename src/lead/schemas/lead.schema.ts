@@ -31,6 +31,9 @@ export class Lead {
 
   @Prop({ default: false })
   tradie_notified: boolean;
+
+  @Prop({ type: String, default: 'LeMans Inquiries' })
+assignedTo: string;
 }
 
 export const LeadSchema = SchemaFactory.createForClass(Lead);
