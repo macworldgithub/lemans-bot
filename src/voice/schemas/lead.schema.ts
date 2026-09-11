@@ -37,6 +37,9 @@ export class Lead {
 
   @Prop()
   activeCampaignContactId: string;
+  
+  @Prop({ type: String, default: 'LeMans Inquiries' })
+assignedTo: string;
 }
 
 export const LeadSchema = SchemaFactory.createForClass(Lead);
