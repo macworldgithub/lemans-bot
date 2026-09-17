@@ -364,7 +364,7 @@
       socket.emit('audio-chunk', { audio: btoa(bin) });
     };
     micSrc.connect(workletNode);
-    workletNode.connect(audioCtx.destination);
+    // Do not connect workletNode to destination to prevent mic feedback loop
   }
 
   function stopMic() {
