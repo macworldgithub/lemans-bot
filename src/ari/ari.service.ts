@@ -553,6 +553,10 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
       };
 
       switch (event.type) {
+        case 'session.updated':
+          this.logger.log(`[${callId}] Session configured — triggering greeting`);
+          aiSession.ws.send(JSON.stringify({ type: 'response.create' }));
+          break;
         case 'response.created':
           aiSession.responseActive = true;
           break;
@@ -566,7 +570,7 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
         case 'input_audio_buffer.speech_stopped':
           aiSession.userSpeaking = false;
           break;
-        case 'response.audio.delta':
+        case 'response.output_audio.delta':
           if (aiSession.userSpeaking || !event.delta) {
             return;
           }
