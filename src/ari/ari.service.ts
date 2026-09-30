@@ -499,7 +499,7 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
             output_modalities: ['audio', 'text'],
             audio: {
               input: {
-                format: { type: 'audio/g711-ulaw' },
+                format: { type: 'audio/pcmu' },
                 turn_detection: {
                   type: 'server_vad',
                   threshold: vadThreshold,
@@ -510,7 +510,7 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
                 },
               },
               output: {
-                format: { type: 'audio/g711-ulaw' },
+                format: { type: 'audio/pcmu' },
               },
             },
             instructions,
