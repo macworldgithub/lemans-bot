@@ -494,6 +494,7 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
         JSON.stringify({
           type: 'session.update',
           session: {
+            type: 'realtime',
             modalities: ['audio', 'text'],
             instructions,
             input_audio_format: 'g711_ulaw',
