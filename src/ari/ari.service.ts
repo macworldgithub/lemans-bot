@@ -495,18 +495,25 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
           type: 'session.update',
           session: {
             type: 'realtime',
-            modalities: ['audio', 'text'],
-            instructions,
-            input_audio_format: 'g711_ulaw',
-            output_audio_format: 'g711_ulaw',
-            turn_detection: {
-              type: 'server_vad',
-              threshold: vadThreshold,
-              prefix_padding_ms: vadPrefixPaddingMs,
-              silence_duration_ms: vadSilenceDurationMs,
-              create_response: true,
-              interrupt_response: true,
+            model,
+            output_modalities: ['audio', 'text'],
+            audio: {
+              input: {
+                format: { type: 'audio/g711-ulaw' },
+                turn_detection: {
+                  type: 'server_vad',
+                  threshold: vadThreshold,
+                  prefix_padding_ms: vadPrefixPaddingMs,
+                  silence_duration_ms: vadSilenceDurationMs,
+                  create_response: true,
+                  interrupt_response: true,
+                },
+              },
+              output: {
+                format: { type: 'audio/g711-ulaw' },
+              },
             },
+            instructions,
           },
         }),
       );
