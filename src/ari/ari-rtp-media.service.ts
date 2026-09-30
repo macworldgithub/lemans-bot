@@ -103,8 +103,30 @@ export class AriRtpMediaService implements OnModuleInit, OnModuleDestroy {
       return;
     }
 
-    const rtpPacket = this.buildRtpPacket(session, ulawPayload);
-    this.socket.send(rtpPacket, session.remote.port, session.remote.address);
+    // Standard telephony RTP: 160 bytes per packet = 20ms at 8kHz µ-law.
+    // OpenAI sends large chunks (e.g. 3200 bytes); Asterisk drops oversized packets.
+    const PACKET_SIZE = 160;
+    const PTIME_MS = 20;
+
+    for (let offset = 0; offset < ulawPayload.length; offset += PACKET_SIZE) {
+      const chunk = ulawPayload.subarray(
+        offset,
+        Math.min(offset + PACKET_SIZE, ulawPayload.length),
+      );
+      const rtpPacket = this.buildRtpPacket(session, chunk);
+
+      // Pace packets at 20ms intervals to avoid jitter buffer overflow
+      const delay = (offset / PACKET_SIZE) * PTIME_MS;
+      if (delay === 0) {
+        this.socket.send(rtpPacket, session.remote.port, session.remote.address);
+      } else {
+        setTimeout(() => {
+          if (this.socket) {
+            this.socket.send(rtpPacket, session.remote!.port, session.remote!.address);
+          }
+        }, delay);
+      }
+    }
   }
 
   private startSocket() {

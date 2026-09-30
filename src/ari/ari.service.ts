@@ -692,10 +692,14 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
   private async createWebSocketExternalMediaChannel(
     callId: string,
   ): Promise<string | undefined> {
-    const wsPort = this.configService.get<number>('WEBSOCKET_PORT', 9090);
-    const wsHost = `127.0.0.1:${wsPort}`; // Use IP instead of localhost for Asterisk DNS
+    // externalMedia without explicit transport defaults to UDP/RTP,
+    // so point it at the RTP listener (port 6001) and use ulaw format
+    // to match OpenAI's audio/pcmu input/output.
+    const externalHost =
+      this.configService.get<string>('ASTERISK_EXTERNAL_MEDIA_HOST') ||
+      '127.0.0.1:6001';
 
-    this.logger.log(`[${callId}] Creating externalMedia with host=${wsHost}`);
+    this.logger.log(`[${callId}] Creating externalMedia with host=${externalHost}`);
 
     const response = await this.ariRequest<any>(
       'post',
@@ -703,15 +707,14 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
       {
         app: this.getAriApp(),
         channelId: `extmedia-${callId}`,
-        external_host: wsHost, // Use IP instead of localhost
-        format: 'slin', // 8kHz, 16-bit signed PCM mono
+        external_host: externalHost,
+        format: 'ulaw',
         direction: 'both',
-        // Remove transport parameter - not supported in this Asterisk version
       },
     );
 
     this.logger.log(
-      `Created WebSocket externalMedia channel for call=${callId} host=${wsHost} channelId=${response?.id}`,
+      `Created externalMedia channel for call=${callId} host=${externalHost} channelId=${response?.id}`,
     );
     return response?.id;
   }
