@@ -21,6 +21,8 @@ type RtpSession = {
   txSequence: number;
   txTimestamp: number;
   ssrc: number;
+  txQueue?: Buffer;
+  txDrainTimer?: ReturnType<typeof setInterval> | null;
 };
 
 type AudioFrameHandler = (frame: {
@@ -89,6 +91,12 @@ export class AriRtpMediaService implements OnModuleInit, OnModuleDestroy {
       return;
     }
 
+    if (session.txDrainTimer) {
+      clearInterval(session.txDrainTimer);
+      session.txDrainTimer = null;
+    }
+    session.txQueue = undefined;
+
     if (session.remote) {
       this.remoteKeyToCallId.delete(this.toRemoteKey(session.remote));
     }
@@ -103,30 +111,52 @@ export class AriRtpMediaService implements OnModuleInit, OnModuleDestroy {
       return;
     }
 
-    // Standard telephony RTP: 160 bytes per packet = 20ms at 8kHz µ-law.
-    // OpenAI sends large chunks (e.g. 3200 bytes); Asterisk drops oversized packets.
-    const PACKET_SIZE = 160;
+    // Append to the session's output queue; the drain timer sends at steady 20ms pace
+    if (!session.txQueue) {
+      session.txQueue = Buffer.alloc(0);
+    }
+    session.txQueue = Buffer.concat([session.txQueue, ulawPayload]);
+
+    // Start the drain timer if not already running
+    if (!session.txDrainTimer) {
+      this.startDrainTimer(session);
+    }
+  }
+
+  /**
+   * Flush any queued audio (called on barge-in / speech start)
+   */
+  flushQueue(callId: string) {
+    const session = this.sessions.get(callId);
+    if (!session) return;
+    session.txQueue = Buffer.alloc(0);
+  }
+
+  private startDrainTimer(session: RtpSession) {
+    const PACKET_SIZE = 160; // 20ms at 8kHz µ-law
     const PTIME_MS = 20;
 
-    for (let offset = 0; offset < ulawPayload.length; offset += PACKET_SIZE) {
-      const chunk = ulawPayload.subarray(
-        offset,
-        Math.min(offset + PACKET_SIZE, ulawPayload.length),
-      );
-      const rtpPacket = this.buildRtpPacket(session, chunk);
-
-      // Pace packets at 20ms intervals to avoid jitter buffer overflow
-      const delay = (offset / PACKET_SIZE) * PTIME_MS;
-      if (delay === 0) {
-        this.socket.send(rtpPacket, session.remote.port, session.remote.address);
-      } else {
-        setTimeout(() => {
-          if (this.socket) {
-            this.socket.send(rtpPacket, session.remote!.port, session.remote!.address);
-          }
-        }, delay);
+    session.txDrainTimer = setInterval(() => {
+      if (!session.txQueue || session.txQueue.length === 0) {
+        // Nothing left to send — stop the timer
+        if (session.txDrainTimer) {
+          clearInterval(session.txDrainTimer);
+          session.txDrainTimer = null;
+        }
+        return;
       }
-    }
+
+      if (!session.remote || !this.socket) {
+        return;
+      }
+
+      // Take one 160-byte packet from the front of the queue
+      const chunk = session.txQueue.subarray(0, PACKET_SIZE);
+      session.txQueue = session.txQueue.subarray(chunk.length);
+
+      const rtpPacket = this.buildRtpPacket(session, chunk);
+      this.socket.send(rtpPacket, session.remote.port, session.remote.address);
+    }, PTIME_MS);
   }
 
   private startSocket() {

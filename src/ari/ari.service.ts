@@ -622,6 +622,8 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
     if (aiSession.responseActive) {
       aiSession.ws.send(JSON.stringify({ type: 'response.cancel' }));
       aiSession.responseActive = false;
+      // Flush queued audio so caller doesn't hear stale output
+      this.ariRtpMediaService.flushQueue(callId);
       this.logger.debug(
         `Barge-in triggered response.cancel for call=${callId}`,
       );
