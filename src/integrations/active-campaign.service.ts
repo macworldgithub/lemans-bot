@@ -4,6 +4,7 @@ import { ConfigService } from '@nestjs/config';
 interface ContactPayload {
   firstName: string;
   phone?: string;
+  email?: string;
   tag?: string;
   fieldValues?: Array<{ field: string; value: string }>;
 }
@@ -34,6 +35,7 @@ export class ActiveCampaignService {
       contact: {
         firstName: payload.firstName,
         phone: payload.phone ?? '',
+        email: payload.email ?? '',
         fieldValues: payload.fieldValues ?? [],
       },
     };

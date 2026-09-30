@@ -14,8 +14,17 @@ import { LEMANS_SYSTEM_PROMPT, SAVE_LEAD_TOOL } from './lemans-knowledge';
 
 export type EventType =
   | 'kids_party'
+  | 'teen_party'
   | 'buck_party'
   | 'corporate'
+  | 'adult_party'
+  | 'karts'
+  | 'vr'
+  | 'activities'
+  | 'booking_change'
+  | 'complaint'
+  | 'after_hours'
+  | 'school_group'
   | 'general_enquiry'
   | 'unknown';
 
@@ -53,8 +62,17 @@ interface FunctionCallPayload {
 // Transfer number map — populate from env
 const TRANSFER_NUMBERS: Record<EventType, string | null> = {
   kids_party: process.env.TRANSFER_KIDS_PARTY ?? null,
+  teen_party: process.env.TRANSFER_TEEN_PARTY ?? null,
   buck_party: process.env.TRANSFER_BUCK_PARTY ?? null,
   corporate: process.env.TRANSFER_CORPORATE ?? null,
+  adult_party: process.env.TRANSFER_ADULT_PARTY ?? null,
+  karts: process.env.TRANSFER_KARTS ?? null,
+  vr: process.env.TRANSFER_VR ?? null,
+  activities: process.env.TRANSFER_ACTIVITIES ?? null,
+  booking_change: process.env.TRANSFER_BOOKING_CHANGE ?? null,
+  complaint: process.env.TRANSFER_COMPLAINT ?? null,
+  after_hours: null,
+  school_group: process.env.TRANSFER_SCHOOL_GROUP ?? null,
   general_enquiry: process.env.TRANSFER_GENERAL ?? null,
   unknown: process.env.TRANSFER_GENERAL ?? null,
 };
@@ -541,6 +559,7 @@ export class VoiceService {
     const lead = await this.leadModel.create({
       callerName: args.caller_name,
       callerNumber: args.caller_number || session.callerNumber,
+      callerEmail: args.caller_email,
       eventType: args.event_type,
       eventDate: args.event_date,
       groupSize: args.group_size,
@@ -553,11 +572,30 @@ export class VoiceService {
     this.logger.log(`[${sessionId}] Lead saved: ${lead._id} (assigned to ${assignedTo})`);
 
     // ── Push to ActiveCampaign ───────────────────────────────────────────────
+    const tagMap: Record<string, string> = {
+      kids_party: 'KidsParty',
+      teen_party: 'TeenParty',
+      buck_party: 'BucksHens',
+      corporate: 'Corporate',
+      adult_party: 'AdultParty',
+      karts: 'Karts',
+      vr: 'VR',
+      activities: 'Activities',
+      booking_change: 'BookingChange',
+      complaint: 'Complaint',
+      after_hours: 'AfterHours',
+      school_group: 'SchoolGroup',
+      general_enquiry: 'GeneralEnquiry',
+      unknown: 'Unknown',
+    };
+    const activeCampaignTag = tagMap[args.event_type] || args.event_type;
+
     try {
       await this.activeCampaign.createContact({
         firstName: args.caller_name,
         phone: args.caller_number || session.callerNumber,
-        tag: args.event_type,
+        email: args.caller_email,
+        tag: activeCampaignTag,
         fieldValues: [
           { field: 'EVENT_TYPE',   value: args.event_type ?? '' },
           { field: 'EVENT_DATE',   value: args.event_date ?? '' },

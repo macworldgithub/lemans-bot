@@ -11,9 +11,27 @@ export class Lead {
   @Prop()
   callerNumber: string;
 
+  @Prop()
+  callerEmail?: string;
+
   @Prop({
     required: true,
-    enum: ['kids_party', 'buck_party', 'corporate', 'general_enquiry', 'unknown'],
+    enum: [
+      'kids_party',
+      'teen_party',
+      'buck_party',
+      'corporate',
+      'adult_party',
+      'karts',
+      'vr',
+      'activities',
+      'booking_change',
+      'complaint',
+      'after_hours',
+      'school_group',
+      'general_enquiry',
+      'unknown',
+    ],
   })
   eventType: string;
 

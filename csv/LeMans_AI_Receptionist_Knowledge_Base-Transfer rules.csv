@@ -1,0 +1,16 @@
+Transfer and escalation rules,,,,,,
+Priority,Intent / trigger,Action,Destination name,Destination number,If unanswered,Notes
+1,Emergency / injury / on-site incident now,"Do not handle. Warm transfer immediately. If no answer, tell caller to go to staff on site or call 000 if life-threatening.",Duty manager,TO FILL,000 if life-threatening; otherwise take name + location on site,Never diagnose.
+2,Corporate / team building / Christmas / 20+ headcount sales,"Qualify company, date, headcount, then warm transfer to corporate sales mobile.",Corporate sales,TO FILL,ActiveCampaign lead tag Corporate,POC: corporate is priority transfer.
+3,Kids party 6–12 / birthday,"Answer basics. If they want to book or discuss catering/date, transfer Reservations.",Reservations,TO FILL — default (03) 8787 8741 internal 503?,Lead tag KidsParty,Deposit required to hold date. Urge weekday mid-week deal if weekend full.
+4,Teen party 12–17,Same as kids party but teen packages.,Reservations,TO FILL,Lead tag TeenParty,
+5,Bucks / hens,Answer package outline. Transfer to book. Mention weekends sell out.,Reservations / events,TO FILL,Lead tag BucksHens,Show Off $199pp / Hang Out $139pp published — confirm still current.
+6,Adult birthday / 18th / 21st / social group,Qualify activity mix then transfer to book.,Reservations,TO FILL,Lead tag AdultParty,
+7,Go-kart casual / walk-up / race club / academy,Hours + whether booking needed. Transfer if they want a time locked.,Track / reservations,TO FILL,Lead tag Karts,Super Karts 18+ or 16+ with learner permit + ID.
+8,VR / Zero Latency,Age/game fit then transfer or take booking details.,Reservations,TO FILL,Lead tag VR,Max 8 per session.
+9,Lasertag / mini golf / arcade only,Can often self-serve. Transfer if exclusive hire or party.,Reservations,TO FILL,Lead tag Activities,Lasertag 6+. Mini golf 4+ (under 4 free). Arcade 3+.
+10,Existing booking change / catering / numbers / balance,Transfer Reservations. Do not change a booking yourself in POC.,Reservations,TO FILL,Lead tag BookingChange + existing date,Reschedule needs 7 days notice.
+11,Complaint / refund / no-show credit,Empathise. Do not promise money. Transfer duty manager.,Duty manager,TO FILL,Lead tag Complaint,Deposits are non-refundable per FAQ.
+12,Job / media / supplier,Take message. Do not transfer floor staff.,Office,TO FILL,Email info@,Careers page exists.
+13,After hours / booking office closed,Answer public FAQs. Capture lead. Do not pretend a human is available.,Lead only,—,ActiveCampaign + next-day callback,Booking office from 9am daily.
+14,Unknown / cannot answer,Do not guess prices or medical clearance. Transfer or take lead.,Reservations,TO FILL,Lead tag Unknown,Safer to escalate than invent.
