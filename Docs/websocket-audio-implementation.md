@@ -62,8 +62,10 @@ ASTERISK_EXTERNAL_MEDIA_BIND_PORT=6000
 
 # AI Configuration
 OPENAI_API_KEY=your-openai-api-key
-OPENAI_REALTIME_MODEL=gpt-4o-mini-realtime-preview
+OPENAI_LIVE_VOICE=quartz
 ```
+
+Both browser and Asterisk sessions use `gpt-live-1`. Browser audio is PCM16 at 24 kHz; Asterisk uses G.711 μ-law at 8 kHz. The server streams both directly through the GPT-Live session, with no ElevenLabs speech synthesis service.
 
 ## Call Flow
 

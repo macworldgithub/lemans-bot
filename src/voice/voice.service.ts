@@ -8,7 +8,7 @@ import { TLSSocket } from 'tls';
 import WebSocket from 'ws';
 import { Lead, LeadDocument } from './schemas/lead.schema';
 import { ActiveCampaignService } from '../integrations/active-campaign.service';
-import { LEMANS_SYSTEM_PROMPT, SAVE_LEAD_TOOL } from './lemans-knowledge';
+import { LEMANS_SYSTEM_PROMPT } from './lemans-knowledge';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -30,33 +30,17 @@ export type EventType =
 
 interface RealtimeSession {
   ws: WebSocket;
-  elevenLabsWs: WebSocket | null;
-  elevenLabsReady: boolean;
-  textBuffer: string[];
-  isResponseActive: boolean;
   onEvent: (event: any) => void;
   sessionStartedAtMs: number;
-  openAiConnectedAtMs: number | null;
-  elevenLabsConnectedAtMs: number | null;
   greetingTriggeredAtMs: number | null;
-  firstResponseCreatedAtMs: number | null;
+  outputAudioTimer: ReturnType<typeof setTimeout> | null;
   firstAudioDeltaLogged: boolean;
-  processedFunctionCallIds: Set<string>;
-  lastQuestionAsked: string;
-  lastRealAnswer: string;
-  isRepromptActive: boolean;
   silenceRepromptCount: number;
-  detectedEventType: EventType;
-  corporateSizeTier: 'small' | 'large' | 'unknown';
   callerNumber: string;
-  preferredLanguage: string;
   silenceTimer: ReturnType<typeof setTimeout> | null;
-}
-
-interface FunctionCallPayload {
-  name: string;
-  arguments: string;
-  call_id: string;
+  callerTranscript: string;
+  lastInputTranscriptAtMs: number;
+  savedLead: boolean;
 }
 
 // Transfer number map — populate from env
@@ -90,31 +74,12 @@ export class VoiceService {
     private readonly activeCampaign: ActiveCampaignService,
   ) {}
 
-  // ─── Type guard ─────────────────────────────────────────────────────────────
-
-  private toFunctionCallPayload(value: unknown): FunctionCallPayload | null {
-    if (!value || typeof value !== 'object') return null;
-    const r = value as Record<string, unknown>;
-    if (r.type !== 'function_call') return null;
-    if (
-      typeof r.name !== 'string' ||
-      typeof r.arguments !== 'string' ||
-      typeof r.call_id !== 'string'
-    )
-      return null;
-    return { name: r.name, arguments: r.arguments, call_id: r.call_id };
-  }
-
   // ─── Silence handling ────────────────────────────────────────────────────────
 
   handleSilenceTimeout(sessionId: string): void {
     const session = this.sessions.get(sessionId);
     if (!session) return;
 
-    if (session.isResponseActive) {
-      this.logger.debug(`[${sessionId}] Silence ignored — response still active`);
-      return;
-    }
 
     session.silenceRepromptCount += 1;
 
@@ -142,7 +107,6 @@ export class VoiceService {
       session.silenceTimer = null;
     }
 
-    if (session.isResponseActive) return;
 
     const SILENCE_TIMEOUT_MS = 8_000;
     session.silenceTimer = setTimeout(() => {
@@ -163,24 +127,12 @@ export class VoiceService {
     const session = this.sessions.get(sessionId);
     if (!session || session.ws.readyState !== WebSocket.OPEN) return;
 
-    session.isRepromptActive = true;
 
-    session.ws.send(
-      JSON.stringify({
-        type: 'conversation.item.create',
-        item: {
-          type: 'message',
-          role: 'user',
-          content: [
-            {
-              type: 'input_text',
-              text: `[SYSTEM: The caller has been quiet. Re-engage warmly by saying: "${text}"]`,
-            },
-          ],
-        },
-      }),
-    );
-    session.ws.send(JSON.stringify({ type: 'response.create' }));
+    session.ws.send(JSON.stringify({
+      type: 'session.instructions.append',
+      delegation_id: null,
+      content: `The caller has been quiet. Re-engage warmly by saying: ${text}`,
+    }));
   }
 
   // ─── Create session ──────────────────────────────────────────────────────────
@@ -191,13 +143,8 @@ export class VoiceService {
     callerNumber = 'unknown',
   ): Promise<void> {
     const apiKey = this.config.get<string>('OPENAI_API_KEY');
-    const model = this.config.get<string>('OPENAI_REALTIME_MODEL') ?? 'gpt-realtime-2';
-    const inputSampleRate = Number(this.config.get<string>('OPENAI_INPUT_SAMPLE_RATE') ?? 24000);
-    const vadThreshold = Number(this.config.get<string>('OPENAI_VAD_THRESHOLD') ?? 0.65);
-    const vadPrefixPaddingMs = Number(this.config.get<string>('OPENAI_VAD_PREFIX_PADDING_MS') ?? 300);
-    // Lower silence duration to 600ms (down from 2000ms) for snappy, natural conversation
-    const vadSilenceDurationMs = Number(this.config.get<string>('OPENAI_VAD_SILENCE_DURATION_MS') ?? 600);
-    const url = `wss://api.openai.com/v1/realtime?model=${model}`;
+    const model = 'gpt-live-1';
+    const url = 'wss://api.openai.com/v1/live/sessions';
     const sessionStartedAtMs = Date.now();
 
     return new Promise((resolve, reject) => {
@@ -205,71 +152,50 @@ export class VoiceService {
         headers: { Authorization: `Bearer ${apiKey}` },
       });
 
-      this.instrumentHandshake(sessionId, 'OpenAI', ws, sessionStartedAtMs);
+      this.instrumentHandshake(sessionId, 'GPT-Live', ws, sessionStartedAtMs);
 
       ws.on('open', () => {
-        const openAiConnectedAtMs = Date.now();
-        this.logger.log(`[${sessionId}] OpenAI connected in ${openAiConnectedAtMs - sessionStartedAtMs}ms`);
+        this.logger.log(`[${sessionId}] GPT-Live WebSocket connected in ${Date.now() - sessionStartedAtMs}ms`);
 
         ws.send(
           JSON.stringify({
-            type: 'session.update',
+            type: 'session.start',
             session: {
-              type: 'realtime',
               model,
-              output_modalities: ['text'],
+              instructions: `${this.getSystemPrompt()}\n\nGPT-Live conversation guidance: Speak warmly and concisely in a natural Australian voice. Ask one clear question at a time. For callback, booking, complaint, or other staff follow-up requests, collect the caller’s name and request details, then delegate the task to the application to save the enquiry.`,
               audio: {
-                input: {
-                  format: { type: 'audio/pcm', rate: inputSampleRate },
-                  turn_detection: {
-                    type: 'server_vad',
-                    threshold: vadThreshold,
-                    prefix_padding_ms: vadPrefixPaddingMs,
-                    silence_duration_ms: vadSilenceDurationMs,
-                  },
-                },
+                format: { type: 'audio/pcm', rate: 24000 },
+                output: { voice: this.config.get<string>('OPENAI_LIVE_VOICE') ?? 'quartz' },
               },
-              instructions: this.getSystemPrompt(),
-              tools: [
-                this.getSaveLeadTool(),
-              ],
-              tool_choice: 'auto',
+              delegation: { type: 'client' },
             },
           }),
         );
 
         this.sessions.set(sessionId, {
           ws,
-          elevenLabsWs: null,
-          elevenLabsReady: false,
-          textBuffer: [],
-          isResponseActive: false,
           onEvent,
           sessionStartedAtMs,
-          openAiConnectedAtMs,
-          elevenLabsConnectedAtMs: null,
           greetingTriggeredAtMs: null,
-          firstResponseCreatedAtMs: null,
           firstAudioDeltaLogged: false,
-          processedFunctionCallIds: new Set(),
-          lastQuestionAsked: '',
-          lastRealAnswer: '',
-          isRepromptActive: false,
+          outputAudioTimer: null,
           silenceRepromptCount: 0,
-          detectedEventType: 'unknown',
-          corporateSizeTier: 'unknown',
           callerNumber,
-          preferredLanguage: 'english',
           silenceTimer: null,
+          callerTranscript: '',
+          lastInputTranscriptAtMs: 0,
+          savedLead: false,
         });
 
-        this.openElevenLabsStream(sessionId);
-        resolve();
       });
 
       ws.on('message', async (data: WebSocket.Data) => {
         try {
           const event = JSON.parse(data.toString());
+          if (event.type === 'session.started') resolve();
+          if (event.type === 'session.delegation.created') {
+            await this.handleClientDelegation(sessionId, event.delegation?.id);
+          }
           await this.handleRealtimeEvent(sessionId, event);
         } catch (err) {
           this.logger.error(`[${sessionId}] Failed to parse event:`, err);
@@ -277,14 +203,15 @@ export class VoiceService {
       });
 
       ws.on('error', (err) => {
-        this.logger.error(`[${sessionId}] OpenAI WS error:`, err);
-        onEvent({ type: 'error', error: { message: err.message } });
+        this.logger.error(`[${sessionId}] GPT-Live WS error:`, err);
+        onEvent({ type: 'realtime-error', error: { message: err.message } });
         reject(err);
       });
 
       ws.on('close', (code, reason) => {
-        this.logger.log(`[${sessionId}] OpenAI WS closed: ${code} - ${reason}`);
-        this.closeElevenLabsWs(sessionId);
+        this.logger.log(`[${sessionId}] GPT-Live WS closed: ${code} - ${reason}`);
+        const closedSession = this.sessions.get(sessionId);
+        if (closedSession?.outputAudioTimer) clearTimeout(closedSession.outputAudioTimer);
         this.sessions.delete(sessionId);
         onEvent({ type: 'session-closed' });
       });
@@ -296,7 +223,7 @@ export class VoiceService {
   sendAudio(sessionId: string, base64Audio: string): void {
     const session = this.sessions.get(sessionId);
     if (!session) return;
-    session.ws.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: base64Audio }));
+    session.ws.send(JSON.stringify({ type: 'session.input_audio.append', audio: base64Audio }));
   }
 
   // ─── Trigger greeting ────────────────────────────────────────────────────────
@@ -305,120 +232,7 @@ export class VoiceService {
     const session = this.sessions.get(sessionId);
     if (!session) return;
     session.greetingTriggeredAtMs = Date.now();
-    session.ws.send(JSON.stringify({ type: 'response.create' }));
-  }
-
-  // ─── ElevenLabs stream ───────────────────────────────────────────────────────
-
-  private openElevenLabsStream(sessionId: string, force = false): void {
-    const session = this.sessions.get(sessionId);
-    if (!session) return;
-
-    if (
-      !force &&
-      session.elevenLabsWs &&
-      (session.elevenLabsWs.readyState === WebSocket.OPEN ||
-        session.elevenLabsWs.readyState === WebSocket.CONNECTING)
-    ) {
-      return;
-    }
-
-    this.closeElevenLabsWs(sessionId);
-
-    const apiKey = this.config.get<string>('ELEVENLABS_API_KEY');
-    const voiceId = this.config.get<string>('ELEVENLABS_VOICE_ID');
-    const modelId = this.config.get<string>('ELEVENLABS_MODEL_ID') ?? 'eleven_turbo_v2_5';
-    const wsUrl = `wss://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream-input?model_id=${modelId}&output_format=pcm_16000`;
-
-    const elWs = new WebSocket(wsUrl);
-    this.instrumentHandshake(sessionId, 'ElevenLabs', elWs, session.sessionStartedAtMs);
-
-    elWs.on('open', () => {
-      this.logger.log(`[${sessionId}] ElevenLabs connected (${modelId})`);
-      session.elevenLabsConnectedAtMs = Date.now();
-
-      elWs.send(
-        JSON.stringify({
-          text: ' ',
-          voice_settings: {
-            stability: 0.5,
-            similarity_boost: 0.75,
-            style: 0.25,
-            use_speaker_boost: true,
-          },
-          xi_api_key: apiKey,
-        }),
-      );
-
-      if (session.elevenLabsWs === elWs) {
-        session.elevenLabsReady = true;
-        for (const text of session.textBuffer) {
-          this.sendTextToElevenLabs(sessionId, text);
-        }
-        session.textBuffer = [];
-      }
-    });
-
-    elWs.on('message', (data: WebSocket.Data) => {
-      try {
-        const msg = JSON.parse(data.toString());
-        if (msg.audio) {
-          if (!session.firstAudioDeltaLogged) {
-            session.firstAudioDeltaLogged = true;
-            this.logger.log(`[${sessionId}] First audio at ${Date.now() - session.sessionStartedAtMs}ms`);
-          }
-          session.onEvent({ type: 'audio-delta', delta: msg.audio });
-        }
-        if (msg.isFinal === true) {
-          session.onEvent({ type: 'audio-done' });
-        }
-      } catch {
-        // binary frames — ignore
-      }
-    });
-
-    elWs.on('error', (err) => {
-      this.logger.warn(`[${sessionId}] ElevenLabs WS error: ${err.message}`);
-    });
-
-    elWs.on('close', () => {
-      if (session.elevenLabsWs === elWs) {
-        session.elevenLabsReady = false;
-      }
-    });
-
-    session.elevenLabsWs = elWs;
-  }
-
-  private sendTextToElevenLabs(sessionId: string, text: string): void {
-    const session = this.sessions.get(sessionId);
-    if (session?.elevenLabsWs?.readyState === WebSocket.OPEN) {
-      session.elevenLabsWs.send(JSON.stringify({ text, try_trigger_generation: true }));
-    }
-  }
-
-  private flushElevenLabsStream(sessionId: string): void {
-    const session = this.sessions.get(sessionId);
-    if (session?.elevenLabsWs?.readyState === WebSocket.OPEN) {
-      session.elevenLabsWs.send(JSON.stringify({ text: '' }));
-    }
-  }
-
-  private closeElevenLabsWs(sessionId: string): void {
-    const session = this.sessions.get(sessionId);
-    if (!session?.elevenLabsWs) return;
-    try {
-      if (session.elevenLabsWs.readyState === WebSocket.CONNECTING) {
-        session.elevenLabsWs.terminate();
-      } else if (session.elevenLabsWs.readyState === WebSocket.OPEN) {
-        session.elevenLabsWs.close();
-      }
-    } catch (err) {
-      this.logger.warn(`[${sessionId}] Error closing ElevenLabs WS: ${err.message}`);
-    }
-    session.elevenLabsWs = null;
-    session.elevenLabsReady = false;
-    session.textBuffer = [];
+    session.ws.send(JSON.stringify({ type: 'session.instructions.append', delegation_id: null, content: 'Greet the caller now in English as Chloe from LeMans Entertainment. Welcome them warmly, introduce yourself, ask how you can help, then pause and listen.' }));
   }
 
   // ─── Event hub ───────────────────────────────────────────────────────────────
@@ -427,120 +241,65 @@ export class VoiceService {
     const session = this.sessions.get(sessionId);
     if (!session) return;
 
-    this.logger.debug(`[${sessionId}] Event: ${event.type}`);
-
     switch (event.type) {
-      case 'response.created':
-        session.isResponseActive = true;
-        session.silenceRepromptCount = 0;
-        if (!session.firstResponseCreatedAtMs) {
-          session.firstResponseCreatedAtMs = Date.now();
-        }
-        this.openElevenLabsStream(sessionId);
+      case 'session.started':
+        this.logger.log(`[${sessionId}] GPT-Live session started`);
         break;
-
-      case 'response.done': {
-        session.isResponseActive = false;
-        const outputs = (event as any).response?.output;
-        if (Array.isArray(outputs)) {
-          for (const item of outputs) {
-            const fn = this.toFunctionCallPayload(item);
-            if (fn) await this.handleFunctionCall(sessionId, fn);
-          }
+      case 'session.output_audio.delta':
+        if (!session.firstAudioDeltaLogged) {
+          session.firstAudioDeltaLogged = true;
+          this.logger.log(`[${sessionId}] First audio at ${Date.now() - session.sessionStartedAtMs}ms`);
         }
+        session.onEvent({ type: 'audio-delta', delta: event.delta });
+        if (session.outputAudioTimer) clearTimeout(session.outputAudioTimer);
+        session.outputAudioTimer = setTimeout(() => {
+          session.outputAudioTimer = null;
+          session.onEvent({ type: 'audio-done' });
+        }, 350);
         break;
-      }
-
-      case 'response.output_text.delta':
-      case 'response.text.delta':
-        if (session.elevenLabsReady) {
-          this.sendTextToElevenLabs(sessionId, event.delta);
-        } else {
-          session.textBuffer.push(event.delta);
-        }
+      case 'session.output_transcript.delta':
         session.onEvent({ type: 'transcript-delta', delta: event.delta });
         break;
-
-      case 'response.output_text.done':
-      case 'response.text.done':
-        if (typeof event.text === 'string' && event.text.trim()) {
-          session.lastQuestionAsked = event.text.trim();
-          if (!session.isRepromptActive) {
-            session.lastRealAnswer = event.text.trim();
-          }
+      case 'session.input_transcript.delta':
+        if (Date.now() - session.lastInputTranscriptAtMs > 1500) {
+          session.onEvent({ type: 'user-transcript-reset' });
         }
-        session.isRepromptActive = false;
-        this.flushElevenLabsStream(sessionId);
-        session.onEvent({ type: 'transcript-done', transcript: event.text });
-        break;
-
-      case 'input_audio_buffer.speech_started':
+        session.lastInputTranscriptAtMs = Date.now();
+        session.callerTranscript += event.delta ?? '';
         session.silenceRepromptCount = 0;
-        session.isRepromptActive = false;
         if (session.silenceTimer) {
           clearTimeout(session.silenceTimer);
           session.silenceTimer = null;
         }
-        if (session.isResponseActive) {
-          try {
-            session.ws.send(JSON.stringify({ type: 'response.cancel' }));
-          } catch (err) {
-            this.logger.warn(`[${sessionId}] Cancel failed: ${err.message}`);
-          }
+        if (session.outputAudioTimer) {
+          clearTimeout(session.outputAudioTimer);
+          session.outputAudioTimer = null;
+          session.onEvent({ type: 'speech-started' });
         }
-        this.closeElevenLabsWs(sessionId);
-        this.openElevenLabsStream(sessionId, true);
-        session.onEvent({ type: 'speech-started' });
+        session.onEvent({ type: 'user-transcript-delta', delta: event.delta });
         break;
-
-      case 'conversation.item.input_audio_transcription.completed':
-        session.onEvent({ type: 'user-transcript', transcript: event.transcript });
+      case 'session.instructions.appended':
         break;
-
-      case 'response.function_call_arguments.done':
-        await this.handleFunctionCall(sessionId, event);
+      case 'response.event':
         break;
-
-      case 'response.output_item.done': {
-        const fn = this.toFunctionCallPayload((event as any).item);
-        if (fn) await this.handleFunctionCall(sessionId, fn);
+      case 'session.delegation.created':
+        session.onEvent({ type: 'delegation-created', delegation: event.delegation });
         break;
-      }
-
+      case 'session.closed':
+        session.onEvent({ type: 'audio-done' });
+        break;
       case 'error':
-        this.logger.error(`[${sessionId}] OpenAI error: ${JSON.stringify(event.error)}`);
+        this.logger.error(`[${sessionId}] GPT-Live error: ${JSON.stringify(event.error)}`);
+        session.onEvent({ type: 'realtime-error', error: event.error });
         break;
-    }
-  }
-
-  // ─── Function call dispatcher ────────────────────────────────────────────────
-
-  private async handleFunctionCall(sessionId: string, event: FunctionCallPayload): Promise<void> {
-    const session = this.sessions.get(sessionId);
-    if (!session) return;
-
-    const callId = event.call_id ?? null;
-    if (callId && session.processedFunctionCallIds.has(callId)) {
-      this.logger.debug(`[${sessionId}] Duplicate fn call ignored: ${callId}`);
-      return;
-    }
-    if (callId) session.processedFunctionCallIds.add(callId);
-
-    try {
-      const args = JSON.parse(event.arguments);
-
-      if (event.name === 'save_lead') {
-        await this.handleSaveLead(sessionId, args, event.call_id);
-      }
-    } catch (err) {
-      if (callId) session.processedFunctionCallIds.delete(callId);
-      this.logger.error(`[${sessionId}] Function call error: ${err.message}`);
+      default:
+        this.logger.debug(`[${sessionId}] Unhandled GPT-Live event: ${event.type}`);
     }
   }
 
   // ─── save_lead ───────────────────────────────────────────────────────────────
 
-  private async handleSaveLead(sessionId: string, args: any, callId: string): Promise<void> {
+  private async handleSaveLead(sessionId: string, args: any, delegationId: string): Promise<void> {
     const session = this.sessions.get(sessionId);
     if (!session) return;
 
@@ -606,37 +365,85 @@ export class VoiceService {
       });
       this.logger.log(`[${sessionId}] ActiveCampaign contact created (owner: ${assignedTo})`);
     } catch (err) {
-      this.logger.warn(`[${sessionId}] ActiveCampaign push failed: ${err.message}`);
+      this.logger.warn(`[${sessionId}] ActiveCampaign push failed: ${err instanceof Error ? err.message : String(err)}`);
     }
 
-    this._sendFunctionResult(sessionId, callId, {
-      success: true,
-      message: isCorporateLarge
-        ? `I've passed your details straight to Skye — she'll give you a call back personally to plan everything!`
-        : `All noted — someone from the team will give you a call back to go through everything with you!`,
-      assigned_to: assignedTo,
-    });
-
-    session.ws.send(JSON.stringify({ type: 'response.create' }));
+    session.ws.send(JSON.stringify({
+      type: 'session.commentary.append',
+      delegation_id: delegationId,
+      content: isCorporateLarge
+        ? `I've passed your details straight to Skye. She'll give you a call back personally to plan everything.`
+        : `All noted. Someone from the team will give you a call back to go through everything with you.`,
+    }));
     session.onEvent({ type: 'lead-saved', data: { ...args, assignedTo } });
   }
 
-  // ─── Helpers ─────────────────────────────────────────────────────────────────
-
-  private _sendFunctionResult(sessionId: string, callId: string, output: object): void {
+  private async handleClientDelegation(sessionId: string, delegationId?: string): Promise<void> {
     const session = this.sessions.get(sessionId);
-    if (!session || session.ws.readyState !== WebSocket.OPEN) return;
+    if (!session || !delegationId || session.savedLead) return;
 
-    session.ws.send(
-      JSON.stringify({
-        type: 'conversation.item.create',
-        item: {
-          type: 'function_call_output',
-          call_id: callId,
-          output: JSON.stringify(output),
-        },
-      }),
-    );
+    const transcript = session.callerTranscript.trim();
+    const lower = transcript.toLowerCase();
+    const wantsFollowUp = /call me back|callback|call back|contact me|speak to (someone|a person|the team)|book(ing)?|quote|complaint|reschedule|change my booking/.test(lower);
+    if (!wantsFollowUp) {
+      session.ws.send(JSON.stringify({
+        type: 'session.thinking.append', delegation_id: delegationId,
+        content: 'No staff follow-up or lead record is needed for this request.',
+      }));
+      return;
+    }
+
+    const nameMatch = transcript.match(/\b(?:my name is|i am|i'm|this is)\s+([a-z][a-z' -]{1,50})/i);
+    const callerName = nameMatch?.[1]?.split(/[,.;!?]|\b(?:and|i|we|my|i'd|i would)\b/i)[0]?.trim();
+    if (!callerName) {
+      session.ws.send(JSON.stringify({
+        type: 'session.commentary.append', delegation_id: delegationId,
+        content: 'Please ask the caller for their name so the team can follow up, then delegate again once they have answered.',
+      }));
+      return;
+    }
+
+    const eventType: EventType = lower.includes('corporate') || lower.includes('company') ? 'corporate'
+      : lower.includes('school') ? 'school_group'
+      : lower.includes('complaint') || lower.includes('unhappy') ? 'complaint'
+      : lower.includes('booking') || lower.includes('reschedule') ? 'booking_change'
+      : lower.includes('teen') ? 'teen_party'
+      : lower.includes('kid') || lower.includes('child') || lower.includes('birthday') ? 'kids_party'
+      : lower.includes('buck') || lower.includes('hens') ? 'buck_party'
+      : lower.includes('kart') || lower.includes('race') ? 'karts'
+      : lower.includes('vr') ? 'vr' : 'general_enquiry';
+    const email = transcript.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i)?.[0];
+    const phone = transcript.match(/\b(?:\+?61|0)[\s()\d-]{8,14}\d\b/)?.[0];
+    if ((!phone && session.callerNumber === 'unknown')) {
+      session.ws.send(JSON.stringify({
+        type: 'session.commentary.append', delegation_id: delegationId,
+        content: 'Please ask the caller for a callback phone number, then delegate again once they have answered.',
+      }));
+      return;
+    }
+    const groupSize = Number(transcript.match(/\b(\d{1,3})\s+(?:people|guests|kids|children|attendees)\b/i)?.[1]) || undefined;
+    const eventDate = transcript.match(/\b(?:on|for|around)\s+((?:next\s+)?(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday|\d{1,2}\s+\w+|\w+\s+\d{1,2}))\b/i)?.[1];
+    const details = transcript.slice(-1600);
+
+    session.savedLead = true;
+    try {
+      await this.handleSaveLead(sessionId, {
+        caller_name: callerName,
+        caller_number: session.callerNumber !== 'unknown' ? session.callerNumber : phone,
+        caller_email: email,
+        event_type: eventType,
+        event_date: eventDate,
+        group_size: groupSize,
+        enquiry_details: details,
+      }, delegationId);
+    } catch (error) {
+      session.savedLead = false;
+      this.logger.error(`[${sessionId}] Failed to save delegated lead: ${(error as Error).message}`);
+      session.ws.send(JSON.stringify({
+        type: 'session.commentary.append', delegation_id: delegationId,
+        content: 'I could not save the enquiry just now. Apologize briefly and offer the caller the reservations phone number, (03) 8787 8741.',
+      }));
+    }
   }
 
   // ─── Cleanup ─────────────────────────────────────────────────────────────────
@@ -644,7 +451,8 @@ export class VoiceService {
   closeSession(sessionId: string): void {
     const session = this.sessions.get(sessionId);
     if (session) {
-      this.closeElevenLabsWs(sessionId);
+      if (session.outputAudioTimer) clearTimeout(session.outputAudioTimer);
+      if (session.silenceTimer) clearTimeout(session.silenceTimer);
       try {
         session.ws.close();
       } catch {
@@ -659,7 +467,7 @@ export class VoiceService {
 
   private instrumentHandshake(
     sessionId: string,
-    provider: 'OpenAI' | 'ElevenLabs',
+    provider: 'GPT-Live',
     ws: WebSocket,
     startedAtMs: number,
   ): void {
@@ -695,7 +503,4 @@ export class VoiceService {
     return LEMANS_SYSTEM_PROMPT;
   }
 
-  public getSaveLeadTool() {
-    return SAVE_LEAD_TOOL;
-  }
 }

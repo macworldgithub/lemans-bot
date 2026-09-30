@@ -120,12 +120,7 @@ export class VoiceGateway
     client.emit('session-closed', {});
   }
 
-  /**
-   * The client emits 'playback-done' once the Web Audio API has finished
-   * playing every queued PCM chunk AND ElevenLabs has signalled isFinal.
-   * This is the correct moment to start the silence countdown — the bot
-   * has genuinely stopped speaking from the caller's perspective.
-   */
+  /** Start silence monitoring after the browser finishes queued assistant audio. */
   @SubscribeMessage('playback-done')
   handlePlaybackDone(@ConnectedSocket() client: Socket) {
     this.logger.debug(
@@ -211,7 +206,7 @@ export class VoiceGateway
           break;
 
         case 'audio-done':
-          // Forward to client so it knows ElevenLabs is done streaming for this turn
+          // Forward to client so it knows GPT-Live audio output has gone quiet
           client.emit('audio-done', {});
           break;
 
@@ -221,6 +216,14 @@ export class VoiceGateway
 
         case 'transcript-done':
           client.emit('transcript-done', { transcript: event.transcript });
+          break;
+
+        case 'user-transcript-reset':
+          client.emit('user-transcript-reset', {});
+          break;
+
+        case 'user-transcript-delta':
+          client.emit('user-transcript-delta', { delta: event.delta });
           break;
 
         case 'user-transcript':

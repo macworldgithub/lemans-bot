@@ -40,8 +40,6 @@ type AriCallSession = {
 type AiSession = {
   callId: string;
   ws: WebSocket;
-  userSpeaking: boolean;
-  responseActive: boolean;
   closed: boolean;
   processingAudio: boolean;
 };
@@ -323,7 +321,7 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
     try {
       aiSession.ws.send(
         JSON.stringify({
-          type: 'input_audio_buffer.append',
+          type: 'session.input_audio.append',
           audio: ulawPayload.toString('base64'),
         }),
       );
@@ -357,7 +355,7 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
       if (aiSession.ws.readyState === WebSocket.OPEN) {
         aiSession.ws.send(
           JSON.stringify({
-            type: 'input_audio_buffer.append',
+            type: 'session.input_audio.append',
             audio: ulawBuffer.toString('base64'),
           }),
         );
@@ -463,13 +461,8 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
       return;
     }
 
-    const model =
-      this.configService.get<string>('OPENAI_REALTIME_MODEL') ??
-      'gpt-realtime-2';
-    const vadThreshold = Number(this.configService.get<string>('OPENAI_VAD_THRESHOLD') ?? 0.65);
-    const vadPrefixPaddingMs = Number(this.configService.get<string>('OPENAI_VAD_PREFIX_PADDING_MS') ?? 300);
-    const vadSilenceDurationMs = Number(this.configService.get<string>('OPENAI_VAD_SILENCE_DURATION_MS') ?? 600);
-    const wsUrl = `wss://api.openai.com/v1/realtime?model=${model}`;
+    const model = 'gpt-live-1';
+    const wsUrl = 'wss://api.openai.com/v1/live/sessions';
 
     const ws = new WebSocket(wsUrl, {
       headers: {
@@ -480,40 +473,25 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
     const aiSession: AiSession = {
       callId,
       ws,
-      userSpeaking: false,
-      responseActive: false,
       closed: false,
       processingAudio: false, // Initialize WebSocket audio flag
     };
     this.aiSessions.set(callId, aiSession);
 
     ws.on('open', () => {
-      this.logger.log(`AI Realtime connected for call=${callId} (model=${model})`);
+      this.logger.log(`GPT-Live connected for call=${callId} (model=${model})`);
 
       ws.send(
         JSON.stringify({
-          type: 'session.update',
+          type: 'session.start',
           session: {
-            type: 'realtime',
             model,
-            output_modalities: ['audio'],
-            audio: {
-              input: {
-                format: { type: 'audio/pcmu' },
-                turn_detection: {
-                  type: 'server_vad',
-                  threshold: vadThreshold,
-                  prefix_padding_ms: vadPrefixPaddingMs,
-                  silence_duration_ms: vadSilenceDurationMs,
-                  create_response: true,
-                  interrupt_response: true,
-                },
-              },
-              output: {
-                format: { type: 'audio/pcmu' },
-              },
-            },
             instructions,
+            audio: {
+              format: { type: 'audio/pcmu', rate: 8000 },
+              output: { voice: this.configService.get<string>('OPENAI_LIVE_VOICE') ?? 'quartz' },
+            },
+            delegation: { type: 'client' },
           },
         }),
       );
@@ -525,7 +503,7 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
 
     ws.on('error', (error) => {
       this.logger.warn(
-        `AI Realtime error for call=${callId}: ${error.message}`,
+        `GPT-Live error for call=${callId}: ${error.message}`,
       );
     });
 
@@ -535,7 +513,7 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
         session.closed = true;
       }
       this.aiSessions.delete(callId);
-      this.logger.log(`AI Realtime closed for call=${callId}`);
+      this.logger.log(`GPT-Live closed for call=${callId}`);
     });
   }
 
@@ -553,25 +531,19 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
       };
 
       switch (event.type) {
-        case 'session.updated':
-          this.logger.log(`[${callId}] Session configured — triggering greeting`);
-          aiSession.ws.send(JSON.stringify({ type: 'response.create' }));
+        case 'session.started':
+          this.logger.log(`[${callId}] GPT-Live session started — triggering greeting`);
+          aiSession.ws.send(JSON.stringify({
+            type: 'session.instructions.append',
+            delegation_id: null,
+            content: 'Greet the caller now in English as Chloe from LeMans Entertainment. Welcome them warmly, introduce yourself, ask how you can help, then pause and listen.',
+          }));
           break;
-        case 'response.created':
-          aiSession.responseActive = true;
-          break;
-        case 'response.done':
-          aiSession.responseActive = false;
-          break;
-        case 'input_audio_buffer.speech_started':
-          aiSession.userSpeaking = true;
+        case 'session.input_transcript.delta':
           this.handleBargeIn(callId);
           break;
-        case 'input_audio_buffer.speech_stopped':
-          aiSession.userSpeaking = false;
-          break;
-        case 'response.output_audio.delta':
-          if (aiSession.userSpeaking || !event.delta) {
+        case 'session.output_audio.delta':
+          if (!event.delta) {
             return;
           }
 
@@ -619,15 +591,8 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
       return;
     }
 
-    if (aiSession.responseActive) {
-      aiSession.ws.send(JSON.stringify({ type: 'response.cancel' }));
-      aiSession.responseActive = false;
-      // Flush queued audio so caller doesn't hear stale output
-      this.ariRtpMediaService.flushQueue(callId);
-      this.logger.debug(
-        `Barge-in triggered response.cancel for call=${callId}`,
-      );
-    }
+    // GPT-Live handles turn-taking; discard audio already queued for telephony.
+    this.ariRtpMediaService.flushQueue(callId);
   }
 
   private cleanupAiSession(callId: string) {

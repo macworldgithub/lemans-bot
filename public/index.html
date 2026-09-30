@@ -250,14 +250,17 @@
 
   let playQueue = [];
   let playing   = false;
+  let scheduledAudio = new Set();
+  let nextPlayTime = 0;
 
-  // elevenLabsDone: true once the server fires 'audio-done' for this turn.
+  // audioStreamDone: true once the server fires 'audio-done' for this turn.
   // We only tell the server playback is finished (via 'playback-done') once
   // BOTH this flag is set AND the local play queue has drained.
-  let elevenLabsDone = false;
+  let audioStreamDone = false;
 
   const CAPTURE_SR  = 24000;
-  const PLAYBACK_SR = 16000;
+  const PLAYBACK_SR = 24000;
+  const PLAYBACK_LEAD_SECONDS = 0.06;
 
   // ─── Orb / badge helpers ─────────────────────────────────────────────────────
   function orbState(state) {
@@ -279,44 +282,64 @@
     const f32   = new Float32Array(pcm16.length);
     for (let i = 0; i < pcm16.length; i++) f32[i] = pcm16[i] / 32768;
     playQueue.push(f32);
-    if (!playing) playNext();
+    schedulePlayback();
   }
 
-  function playNext() {
-    // Queue drained — check whether ElevenLabs has also signalled it's done
-    if (!playQueue.length || !audioCtx) {
-      playing = false;
-      if (elevenLabsDone) {
-        // Both conditions met: queue empty + server finished sending.
-        // Signal the server so it can start the silence countdown.
-        elevenLabsDone = false;
-        orbState('listening');
-        setStatus('Listening...', 'connected');
-        socket.emit('playback-done');
-      }
-      return;
+  function schedulePlayback() {
+    if (!audioCtx) return;
+
+    while (playQueue.length) {
+      const samples = playQueue.shift();
+      const buf = audioCtx.createBuffer(1, samples.length, PLAYBACK_SR);
+      buf.copyToChannel(samples, 0);
+      const src = audioCtx.createBufferSource();
+      src.buffer = buf;
+      src.connect(audioCtx.destination);
+      // Schedule on the audio clock so delayed main-thread callbacks don't add gaps.
+      const startAt = Math.max(nextPlayTime, audioCtx.currentTime + PLAYBACK_LEAD_SECONDS);
+      nextPlayTime = startAt + buf.duration;
+      scheduledAudio.add(src);
+      src.onended = () => {
+        scheduledAudio.delete(src);
+        src.disconnect();
+        finishPlaybackIfDrained();
+      };
+      src.start(startAt);
     }
 
-    playing = true;
-    orbState('speaking');
-    setStatus('Chloe is speaking...', 'speaking-badge');
+    if (!playing && scheduledAudio.size) {
+      playing = true;
+      orbState('speaking');
+      setStatus('Chloe is speaking...', 'speaking-badge');
+    }
+    finishPlaybackIfDrained();
+  }
 
-    const samples = playQueue.shift();
-    const buf = audioCtx.createBuffer(1, samples.length, PLAYBACK_SR);
-    buf.copyToChannel(samples, 0);
-    const src = audioCtx.createBufferSource();
-    src.buffer = buf;
-    src.connect(audioCtx.destination);
-    // Recurse: plays next chunk or triggers done logic above
-    src.onended = playNext;
-    src.start();
+  function finishPlaybackIfDrained() {
+    if (playQueue.length || scheduledAudio.size) return;
+    playing = false;
+    nextPlayTime = audioCtx?.currentTime ?? 0;
+    if (audioStreamDone) {
+      audioStreamDone = false;
+      orbState('listening');
+      setStatus('Listening...', 'connected');
+      socket.emit('playback-done');
+    }
   }
 
   function stopPlayback() {
-    playQueue      = [];
-    playing        = false;
-    elevenLabsDone = false;
+    playQueue       = [];
+    playing         = false;
+    audioStreamDone = false;
+    for (const src of scheduledAudio) {
+      src.onended = null;
+      try { src.stop(); } catch {}
+      src.disconnect();
+    }
+    scheduledAudio.clear();
+    nextPlayTime = audioCtx?.currentTime ?? 0;
   }
+
 
   // ─── Microphone capture via AudioWorklet ─────────────────────────────────────
   async function startMic() {
@@ -324,15 +347,24 @@
 
     const code = `
       class PCMProcessor extends AudioWorkletProcessor {
+        constructor() {
+          super();
+          this.packet = new Int16Array(480); // 20ms at 24kHz
+          this.offset = 0;
+        }
         process(inputs) {
           const ch = inputs[0]?.[0];
           if (ch) {
-            const pcm = new Int16Array(ch.length);
             for (let i = 0; i < ch.length; i++) {
               const s = Math.max(-1, Math.min(1, ch[i]));
-              pcm[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+              this.packet[this.offset++] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+              if (this.offset === this.packet.length) {
+                const packet = this.packet;
+                this.port.postMessage(packet.buffer, [packet.buffer]);
+                this.packet = new Int16Array(480);
+                this.offset = 0;
+              }
             }
-            this.port.postMessage(pcm.buffer, [pcm.buffer]);
           }
           return true;
         }
@@ -384,24 +416,24 @@
     panels.style.display = 'flex';
   });
 
-  // Each audio chunk from ElevenLabs via the server
+  // Each audio chunk from GPT-Live via the server
   socket.on('audio-delta', (d) => enqueueAudio(d.delta));
 
-  // FIX: 'audio-done' — ElevenLabs has finished streaming for this turn.
-  // Don't trigger 'playback-done' immediately — the local queue may still
-  // be playing. Set the flag and let playNext() detect the right moment.
+  // The server infers stream completion from a short quiet interval. Wait until
+  // both that signal and the local playback queue have finished.
   socket.on('audio-done', () => {
-    elevenLabsDone = true;
+    audioStreamDone = true;
     // If playback already finished before this event arrived, fire now.
     if (!playing && playQueue.length === 0) {
-      elevenLabsDone = false;
+      audioStreamDone = false;
+      agentText = '';
       orbState('listening');
       setStatus('Listening...', 'connected');
       socket.emit('playback-done');
     }
   });
 
-  // Streaming transcript from OpenAI → text-to-speech pipeline
+  // Streaming transcript from GPT-Live speech output
   let agentText = '';
   socket.on('transcript-delta', (d) => {
     agentText += d.delta;
@@ -411,12 +443,15 @@
     agentText = '';
   });
 
-  // User speech transcription (completed turn)
-  socket.on('user-transcript', (d) => {
-    userPanel.innerHTML = `<span class="active">${d.transcript}</span>`;
+  // User speech transcription
+  let callerText = '';
+  socket.on('user-transcript-reset', () => { callerText = ''; });
+  socket.on('user-transcript-delta', (d) => {
+    callerText += d.delta;
+    userPanel.innerHTML = `<span class="active">${callerText}</span>`;
   });
 
-  // User interrupted — cancel current playback immediately
+  // Caller interruption — stop queued assistant playback immediately
   socket.on('speech-started', () => {
     stopPlayback();
     orbState('listening');
