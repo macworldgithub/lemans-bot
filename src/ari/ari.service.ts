@@ -496,7 +496,7 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
           session: {
             type: 'realtime',
             model,
-            output_modalities: ['audio', 'text'],
+            output_modalities: ['audio'],
             audio: {
               input: {
                 format: { type: 'audio/pcmu' },
