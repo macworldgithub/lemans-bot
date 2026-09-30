@@ -464,14 +464,16 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
     }
 
     const model =
-      this.configService.get<string>('OPENAI_REALTIME_MODEL') ||
-      'gpt-4o-mini-realtime-preview';
+      this.configService.get<string>('OPENAI_REALTIME_MODEL') ??
+      'gpt-realtime-2';
+    const vadThreshold = Number(this.configService.get<string>('OPENAI_VAD_THRESHOLD') ?? 0.65);
+    const vadPrefixPaddingMs = Number(this.configService.get<string>('OPENAI_VAD_PREFIX_PADDING_MS') ?? 300);
+    const vadSilenceDurationMs = Number(this.configService.get<string>('OPENAI_VAD_SILENCE_DURATION_MS') ?? 600);
     const wsUrl = `wss://api.openai.com/v1/realtime?model=${model}`;
 
     const ws = new WebSocket(wsUrl, {
       headers: {
         Authorization: `Bearer ${apiKey}`,
-        'OpenAI-Beta': 'realtime=v1',
       },
     });
 
@@ -486,7 +488,7 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
     this.aiSessions.set(callId, aiSession);
 
     ws.on('open', () => {
-      this.logger.log(`AI Realtime connected for call=${callId}`);
+      this.logger.log(`AI Realtime connected for call=${callId} (model=${model})`);
 
       ws.send(
         JSON.stringify({
@@ -498,9 +500,9 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
             output_audio_format: 'g711_ulaw',
             turn_detection: {
               type: 'server_vad',
-              threshold: 0.6,
-              prefix_padding_ms: 300,
-              silence_duration_ms: 500,
+              threshold: vadThreshold,
+              prefix_padding_ms: vadPrefixPaddingMs,
+              silence_duration_ms: vadSilenceDurationMs,
               create_response: true,
               interrupt_response: true,
             },
