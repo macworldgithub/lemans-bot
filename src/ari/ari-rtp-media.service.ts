@@ -6,6 +6,7 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import dgram, { RemoteInfo, Socket } from 'dgram';
+import { CallLatency } from './call-latency';
 
 type RemoteEndpoint = {
   address: string;
@@ -116,6 +117,7 @@ export class AriRtpMediaService implements OnModuleInit, OnModuleDestroy {
       session.txQueue = Buffer.alloc(0);
     }
     session.txQueue = Buffer.concat([session.txQueue, ulawPayload]);
+    CallLatency.mark(callId, 'OUTPUT_QUEUED', 'First AI audio queued for RTP');
 
     // Start the drain timer if not already running
     if (!session.txDrainTimer) {
@@ -155,7 +157,22 @@ export class AriRtpMediaService implements OnModuleInit, OnModuleDestroy {
       session.txQueue = session.txQueue.subarray(chunk.length);
 
       const rtpPacket = this.buildRtpPacket(session, chunk);
-      this.socket.send(rtpPacket, session.remote.port, session.remote.address);
+      this.socket.send(
+        rtpPacket,
+        session.remote.port,
+        session.remote.address,
+        (error) => {
+          if (error) {
+            this.logger.error('RTP socket error: ' + error.message);
+            return;
+          }
+          CallLatency.mark(
+            session.callId,
+            'T15',
+            'First AI RTP packet sent toward Asterisk',
+          );
+        },
+      );
     }, PTIME_MS);
   }
 

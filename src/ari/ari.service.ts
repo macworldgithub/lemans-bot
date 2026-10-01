@@ -8,6 +8,7 @@ import { ConfigService } from '@nestjs/config';
 import axios from 'axios';
 import type { AxiosInstance } from 'axios';
 import WebSocket from 'ws';
+import { CallLatency } from './call-latency';
 import { VoiceService } from '../voice/voice.service';
 import { AriRtpMediaService } from './ari-rtp-media.service';
 import { AriWebSocketGateway } from './ari-websocket.gateway';
@@ -132,6 +133,12 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
       try {
         const payload = JSON.parse(rawData.toString()) as AriEvent;
         if (payload.type === 'StasisStart') {
+          if (
+            payload.channel?.id &&
+            !payload.channel.id.startsWith('extmedia-')
+          ) {
+            CallLatency.start(payload.channel.id);
+          }
           await this.handleStasisStart(payload);
         } else if (
           payload.type === 'StasisEnd' ||
@@ -186,6 +193,7 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
     );
 
     const callId = channelId;
+    CallLatency.mark(callId, 'T1', 'Incoming call processing begins');
     const bridgeId = `bridge-${callId}`;
 
     let aiInstructions = this.getDefaultAiInstructions();
@@ -208,26 +216,50 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
 
     try {
       this.logger.log(`[${callId}] Step 1: Answering channel ${channelId}`);
+      CallLatency.mark(callId, 'T2', 'answer() called');
       await this.answerChannel(channelId);
+      CallLatency.mark(callId, 'T3', 'Answer HTTP request completed');
       this.logger.log(`[${callId}] Step 2: Creating bridge ${bridgeId}`);
+      CallLatency.mark(callId, 'T4', 'Bridge creation starts');
       await this.createBridge(bridgeId);
+      CallLatency.mark(callId, 'T5', 'Bridge created');
       this.logger.log(
         `[${callId}] Step 3: Adding channel ${channelId} to bridge`,
       );
       await this.addChannelToBridge(bridgeId, channelId);
+      CallLatency.mark(
+        callId,
+        'INBOUND_JOINED',
+        'Inbound channel added to bridge',
+      );
 
       // Use WebSocket externalMedia instead of RTP
       this.logger.log(
         `[${callId}] Step 4: Creating WebSocket externalMedia channel`,
       );
+      CallLatency.mark(
+        callId,
+        'T6',
+        'External media creation starts (UDP/RTP ulaw)',
+      );
       const externalMediaChannelId =
         await this.createWebSocketExternalMediaChannel(callId);
+      CallLatency.mark(
+        callId,
+        'T7',
+        'External media creation HTTP request completed',
+      );
 
       if (externalMediaChannelId) {
         this.logger.log(
           `[${callId}] Step 5: Adding externalMedia channel ${externalMediaChannelId} to bridge`,
         );
         await this.addChannelToBridge(bridgeId, externalMediaChannelId);
+        CallLatency.mark(
+          callId,
+          'MEDIA_JOINED',
+          'External media added to bridge',
+        );
       }
 
       this.logger.log(`[${callId}] Step 6: Setting up session data`);
@@ -252,6 +284,7 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
       this.logger.error(
         `Failed to initialize ARI call bridge for ${callId}: ${(error as Error).message}`,
       );
+      CallLatency.end(callId);
     }
   }
 
@@ -263,6 +296,7 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
 
     const session = this.findSessionByChannel(channelId);
     if (!session) {
+      CallLatency.end(channelId);
       return;
     }
 
@@ -303,10 +337,12 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
     this.ariRtpMediaService.unregisterCallSession(callId);
     this.cleanupAiSession(callId);
     this.sessions.delete(callId);
+    CallLatency.end(callId);
     this.cleanupInProgress.delete(callId);
   }
 
   private handleInboundRtpFrame(callId: string, ulawPayload: Buffer) {
+    CallLatency.mark(callId, 'T12', 'First caller RTP audio received');
     // Keep RTP handler for backward compatibility but prioritize WebSocket
     const aiSession = this.aiSessions.get(callId);
     if (
@@ -325,6 +361,7 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
           audio: ulawPayload.toString('base64'),
         }),
       );
+      CallLatency.mark(callId, 'T13', 'First caller audio forwarded to AI');
     } catch (error) {
       this.logger.warn(
         `Failed to send inbound RTP frame to AI for call=${callId}: ${(error as Error).message}`,
@@ -340,6 +377,7 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
     callId: string,
     audioBuffer: Buffer,
   ): Promise<Buffer | null> {
+    CallLatency.mark(callId, 'T12', 'First caller WebSocket audio received');
     const aiSession = this.aiSessions.get(callId);
     if (!aiSession || aiSession.closed) {
       return null;
@@ -359,6 +397,7 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
             audio: ulawBuffer.toString('base64'),
           }),
         );
+        CallLatency.mark(callId, 'T13', 'First caller audio forwarded to AI');
       }
     } catch (error) {
       this.logger.error(
@@ -464,6 +503,7 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
     const model = 'gpt-live-1';
     const wsUrl = 'wss://api.openai.com/v1/live/sessions';
 
+    CallLatency.mark(callId, 'T8', 'AI WebSocket connection starts');
     const ws = new WebSocket(wsUrl, {
       headers: {
         Authorization: `Bearer ${apiKey}`,
@@ -479,6 +519,7 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
     this.aiSessions.set(callId, aiSession);
 
     ws.on('open', () => {
+      CallLatency.mark(callId, 'T9', 'AI WebSocket connected');
       this.logger.log(`GPT-Live connected for call=${callId} (model=${model})`);
 
       ws.send(
@@ -495,6 +536,7 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
           },
         }),
       );
+      CallLatency.mark(callId, 'T10', 'AI session configuration sent');
     });
 
     ws.on('message', (rawData: WebSocket.RawData) => {
@@ -532,12 +574,14 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
 
       switch (event.type) {
         case 'session.started':
+          CallLatency.mark(callId, 'T11', 'AI session ready');
           this.logger.log(`[${callId}] GPT-Live session started — triggering greeting`);
           aiSession.ws.send(JSON.stringify({
             type: 'session.instructions.append',
             delegation_id: null,
             content: 'Greet the caller now in English as Chloe from LeMans Entertainment. Welcome them warmly, introduce yourself, ask how you can help, then pause and listen.',
           }));
+          CallLatency.mark(callId, 'GREETING', 'Greeting instruction sent');
           break;
         case 'session.input_transcript.delta':
           this.handleBargeIn(callId);
@@ -547,6 +591,7 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
             return;
           }
 
+          CallLatency.mark(callId, 'T14', 'First AI audio delta received');
           // Convert base64 ulaw to buffer
           const ulawBuffer = Buffer.from(event.delta, 'base64');
 
@@ -558,7 +603,13 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
           if (aiSession.processingAudio) {
             // Convert ulaw to slin for WebSocket
             const slinBuffer = this.convertUlawToSlin(ulawBuffer);
-            this.ariWebSocketGateway.sendAudioToCall(callId, slinBuffer);
+            if (this.ariWebSocketGateway.sendAudioToCall(callId, slinBuffer)) {
+              CallLatency.mark(
+                callId,
+                'T15',
+                'First AI audio handed to Asterisk WebSocket',
+              );
+            }
             this.logger.log(
               `[${callId}] Sent audio via WebSocket: ${slinBuffer.length} bytes`,
             );
