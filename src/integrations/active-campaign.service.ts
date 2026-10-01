@@ -41,6 +41,7 @@ export class ActiveCampaignService {
     };
 
     const res = await fetch(url, {
+      signal: AbortSignal.timeout(10_000),
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -72,6 +73,7 @@ export class ActiveCampaignService {
 
     const url = `${this.baseUrl}/api/3/contactTags`;
     await fetch(url, {
+      signal: AbortSignal.timeout(10_000),
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -86,6 +88,7 @@ export class ActiveCampaignService {
       // Search existing tags
       const searchUrl = `${this.baseUrl}/api/3/tags?search=${encodeURIComponent(tagName)}`;
       const res = await fetch(searchUrl, {
+        signal: AbortSignal.timeout(10_000),
         headers: { 'Api-Token': this.apiKey },
       });
       const data = await res.json();
@@ -96,6 +99,7 @@ export class ActiveCampaignService {
 
       // Create new tag
       const createRes = await fetch(`${this.baseUrl}/api/3/tags`, {
+        signal: AbortSignal.timeout(10_000),
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',

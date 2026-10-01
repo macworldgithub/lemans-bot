@@ -66,6 +66,7 @@ export class VoiceService {
   private readonly logger = new Logger(VoiceService.name);
   private sessions = new Map<string, RealtimeSession>();
   private readonly MAX_SILENCE_REPROMPTS = 2;
+  private readonly TOOL_TIMEOUT_MS = 10_000;
 
   constructor(
     private readonly config: ConfigService,
@@ -315,7 +316,8 @@ export class VoiceService {
       `[${sessionId}] Saving lead — caller: ${args.caller_name} | type: ${args.event_type} | assigned: ${assignedTo}`,
     );
 
-    const lead = await this.leadModel.create({
+    const lead = await this.withToolTimeout(
+      this.leadModel.create({
       callerName: args.caller_name,
       callerNumber: args.caller_number || session.callerNumber,
       callerEmail: args.caller_email,
@@ -326,7 +328,9 @@ export class VoiceService {
       assignedTo,
       callId: sessionId,
       source: 'voice_agent',
-    });
+      }),
+      'database_save',
+    );
 
     this.logger.log(`[${sessionId}] Lead saved: ${lead._id} (assigned to ${assignedTo})`);
 
@@ -349,8 +353,8 @@ export class VoiceService {
     };
     const activeCampaignTag = tagMap[args.event_type] || args.event_type;
 
-    try {
-      await this.activeCampaign.createContact({
+    this.logger.log(`[${sessionId}] CRM sync started delegation_id=${delegationId}`);
+    void this.activeCampaign.createContact({
         firstName: args.caller_name,
         phone: args.caller_number || session.callerNumber,
         email: args.caller_email,
@@ -362,11 +366,11 @@ export class VoiceService {
           { field: 'ENQUIRY',      value: args.enquiry_details ?? '' },
           { field: 'ASSIGNED_TO',  value: assignedTo },
         ],
+      }).then(() => {
+        this.logger.log(`[${sessionId}] CRM sync completed delegation_id=${delegationId}`);
+      }).catch((err) => {
+        this.logger.warn(`[${sessionId}] CRM sync failed delegation_id=${delegationId} reason=${err instanceof Error ? err.name : 'unknown'}`);
       });
-      this.logger.log(`[${sessionId}] ActiveCampaign contact created (owner: ${assignedTo})`);
-    } catch (err) {
-      this.logger.warn(`[${sessionId}] ActiveCampaign push failed: ${err instanceof Error ? err.message : String(err)}`);
-    }
 
     session.ws.send(JSON.stringify({
       type: 'session.commentary.append',
@@ -380,12 +384,20 @@ export class VoiceService {
 
   private async handleClientDelegation(sessionId: string, delegationId?: string): Promise<void> {
     const session = this.sessions.get(sessionId);
-    if (!session || !delegationId || session.savedLead) return;
+    if (!session || !delegationId) return;
+    if (session.savedLead) {
+      this.logger.warn(`[${sessionId}] Duplicate delegation ignored delegation_id=${delegationId}`);
+      return;
+    }
+
+    const startedAt = Date.now();
+    this.logger.log(`[${sessionId}] Tool call started name=client_delegation delegation_id=${delegationId}`);
 
     const transcript = session.callerTranscript.trim();
     const lower = transcript.toLowerCase();
     const wantsFollowUp = /call me back|callback|call back|contact me|speak to (someone|a person|the team)|book(ing)?|quote|complaint|reschedule|change my booking/.test(lower);
     if (!wantsFollowUp) {
+      this.logger.log(`[${sessionId}] Tool call completed name=client_delegation delegation_id=${delegationId} result=no_follow_up duration_ms=${Date.now() - startedAt}`);
       session.ws.send(JSON.stringify({
         type: 'session.thinking.append', delegation_id: delegationId,
         content: 'No staff follow-up or lead record is needed for this request.',
@@ -396,6 +408,7 @@ export class VoiceService {
     const nameMatch = transcript.match(/\b(?:my name is|i am|i'm|this is)\s+([a-z][a-z' -]{1,50})/i);
     const callerName = nameMatch?.[1]?.split(/[,.;!?]|\b(?:and|i|we|my|i'd|i would)\b/i)[0]?.trim();
     if (!callerName) {
+      this.logger.warn(`[${sessionId}] Tool call needs caller name delegation_id=${delegationId} duration_ms=${Date.now() - startedAt}`);
       session.ws.send(JSON.stringify({
         type: 'session.commentary.append', delegation_id: delegationId,
         content: 'Please ask the caller for their name so the team can follow up, then delegate again once they have answered.',
@@ -415,6 +428,7 @@ export class VoiceService {
     const email = transcript.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i)?.[0];
     const phone = transcript.match(/\b(?:\+?61|0)[\s()\d-]{8,14}\d\b/)?.[0];
     if ((!phone && session.callerNumber === 'unknown')) {
+      this.logger.warn(`[${sessionId}] Tool call needs callback number delegation_id=${delegationId} duration_ms=${Date.now() - startedAt}`);
       session.ws.send(JSON.stringify({
         type: 'session.commentary.append', delegation_id: delegationId,
         content: 'Please ask the caller for a callback phone number, then delegate again once they have answered.',
@@ -436,13 +450,29 @@ export class VoiceService {
         group_size: groupSize,
         enquiry_details: details,
       }, delegationId);
+      this.logger.log(`[${sessionId}] Tool call completed name=client_delegation delegation_id=${delegationId} duration_ms=${Date.now() - startedAt}`);
     } catch (error) {
       session.savedLead = false;
-      this.logger.error(`[${sessionId}] Failed to save delegated lead: ${(error as Error).message}`);
+      const timedOut = error instanceof Error && error.message.includes('timed out');
+      this.logger.error(`[${sessionId}] Tool call ${timedOut ? 'timed out' : 'failed'} name=client_delegation delegation_id=${delegationId} duration_ms=${Date.now() - startedAt}`);
       session.ws.send(JSON.stringify({
         type: 'session.commentary.append', delegation_id: delegationId,
         content: 'I could not save the enquiry just now. Apologize briefly and offer the caller the reservations phone number, (03) 8787 8741.',
       }));
+    }
+  }
+
+  private async withToolTimeout<T>(operation: Promise<T>, operationName: string): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        operation,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error(`${operationName} timed out`)), this.TOOL_TIMEOUT_MS);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
     }
   }
 

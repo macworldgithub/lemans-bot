@@ -701,7 +701,7 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
     const call = this.sessions.get(callId);
     if (!ai || ai.closed || !call || call.ended) return;
     try {
-      const event = JSON.parse(rawEvent) as { type?: string; delta?: string };
+      const event = JSON.parse(rawEvent) as { type?: string; delta?: string; delegation?: { id?: string; name?: string } };
       switch (event.type) {
         case 'session.started':
           if (ai.ready) return;
@@ -714,6 +714,21 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
         case 'session.input_transcript.delta':
           this.handleBargeIn(callId);
           break;
+        case 'session.delegation.created': {
+          const delegationId = event.delegation?.id;
+          this.logger.log(`[${callId}] Tool call started name=${event.delegation?.name ?? 'client_delegation'} delegation_id=${delegationId ?? 'unknown'}`);
+          if (delegationId && ai.ws.readyState === WebSocket.OPEN) {
+            ai.ws.send(JSON.stringify({
+              type: 'session.commentary.append',
+              delegation_id: delegationId,
+              content: 'This phone session cannot save or route a staff follow-up. Tell the caller that their enquiry could not be submitted here and give them the reservations number, (03) 8787 8741.',
+            }));
+            this.logger.warn(`[${callId}] Tool call completed name=client_delegation delegation_id=${delegationId} result=staff_follow_up_unavailable`);
+          } else {
+            this.logger.warn(`[${callId}] Tool call failed name=client_delegation reason=missing_delegation_id`);
+          }
+          break;
+        }
         case 'session.output_audio.delta': {
           if (!event.delta) return;
           CallLatency.mark(callId, 'T14', 'First AI audio delta received');
@@ -814,12 +829,7 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
   }
 
   private getDefaultAiInstructions() {
-    return [
-      'You are a professional phone voice assistant for a local tradie business.',
-      'Speak briefly and naturally.',
-      'Collect: caller name, issue, address/suburb, and best callback number.',
-      'If interrupted, stop and listen immediately.',
-    ].join(' ');
+    return `${this.voiceService.getSystemPrompt()}\nPhone call guidance: Answer Le Mans service and activity questions directly from the knowledge above. Keep answers brief, and stop to listen when interrupted. This phone session cannot save enquiries or arrange staff callbacks. If a caller needs staff follow-up, provide the reservations number (03) 8787 8741.`;
   }
 
   private async answerChannel(channelId: string) {
