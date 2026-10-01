@@ -9,6 +9,7 @@ import axios from 'axios';
 import type { AxiosInstance } from 'axios';
 import WebSocket from 'ws';
 import { CallLatency } from './call-latency';
+import { PhoneTurnLatency } from './phone-turn-latency';
 import { VoiceService } from '../voice/voice.service';
 import { AriRtpMediaService } from './ari-rtp-media.service';
 import { AriWebSocketGateway } from './ari-websocket.gateway';
@@ -36,6 +37,12 @@ type AriCallSession = {
   bridgeId: string;
   externalMediaChannelId?: string;
   createdAt: string;
+  ended: boolean;
+  mediaReady: boolean;
+  startup?: Promise<void>;
+  cleanup?: Promise<void>;
+  hangupInbound: boolean;
+  turns: PhoneTurnLatency;
 };
 
 type AiSession = {
@@ -43,6 +50,13 @@ type AiSession = {
   ws: WebSocket;
   closed: boolean;
   processingAudio: boolean;
+  ready: boolean;
+  greetingSent: boolean;
+  pendingInput: Buffer[];
+  pendingInputBytes: number;
+  pendingOutput: Buffer[];
+  pendingOutputBytes: number;
+  startupTimer: ReturnType<typeof setTimeout> | null;
 };
 
 @Injectable()
@@ -51,10 +65,12 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
   private eventSocket: WebSocket | null = null;
   private lastEventAt: string | null = null;
   private connected = false;
+  private stopping = false;
   private readonly ariHttpClient: AxiosInstance;
   private readonly sessions = new Map<string, AriCallSession>();
   private readonly aiSessions = new Map<string, AiSession>();
-  private readonly cleanupInProgress = new Set<string>();
+  // Ten seconds of 8 kHz PCMU: bounded startup buffering, never silent truncation.
+  private readonly maxStartupAudioBytes = 80_000;
 
   constructor(
     private readonly configService: ConfigService,
@@ -77,9 +93,17 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
       return this.processWebSocketAudio(callId, audioBuffer);
     });
 
-    // Keep RTP for backward compatibility but don't use it for new calls
+    this.ariRtpMediaService.setStartupFailureHandler((callId, reason) => {
+      this.failPhoneCall(callId, reason);
+    });
+
+    // Production phone calls use RTP
     this.ariRtpMediaService.setAudioFrameHandler((frame) => {
-      this.handleInboundRtpFrame(frame.callId, frame.payload);
+      this.handleInboundRtpFrame(
+        frame.callId,
+        frame.payload,
+        frame.receivedAtMs,
+      );
     });
 
     const autoConnect = this.configService.get<string>(
@@ -90,15 +114,18 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  onModuleDestroy() {
+  async onModuleDestroy() {
+    this.stopping = true;
     if (this.eventSocket) {
       this.eventSocket.close();
       this.eventSocket = null;
     }
 
-    for (const callId of this.aiSessions.keys()) {
-      this.cleanupAiSession(callId);
-    }
+    await Promise.all(
+      [...this.sessions.keys()].map((callId) =>
+        this.cleanupSession(callId, true),
+      ),
+    );
   }
 
   getHealth() {
@@ -165,127 +192,143 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async handleStasisStart(event: AriEvent) {
-    const channelId = event.channel?.id;
-    const callerNumber = event.channel?.caller?.number || 'unknown';
-    const calledNumber = event.channel?.dialplan?.exten || 'unknown';
-
-    if (!channelId) {
-      this.logger.warn('StasisStart received without channel ID');
+    const callId = event.channel?.id;
+    if (
+      this.stopping ||
+      !callId ||
+      callId.startsWith('extmedia-') ||
+      this.sessions.has(callId)
+    )
       return;
-    }
-
-    if (channelId.startsWith('extmedia-')) {
-      this.logger.debug(
-        `Ignoring StasisStart for externalMedia channel=${channelId}`,
-      );
-      return;
-    }
-
-    if (this.sessions.has(channelId)) {
-      this.logger.warn(
-        `Ignoring duplicate StasisStart for channel=${channelId}`,
-      );
-      return;
-    }
-
-    this.logger.log(
-      `StasisStart received. channel=${channelId || 'unknown'} caller=${callerNumber} called=${calledNumber}`,
-    );
-
-    const callId = channelId;
+    CallLatency.start(callId);
     CallLatency.mark(callId, 'T1', 'Incoming call processing begins');
-    const bridgeId = `bridge-${callId}`;
-
-    let aiInstructions = this.getDefaultAiInstructions();
-
-    // try {
-    //   const voiceContext = await this.voiceService.handleIncomingCall({
-    //     call_id: callId,
-    //     caller_number: callerNumber,
-    //     called_number: calledNumber,
-    //   });
-
-    //   if (voiceContext?.success) {
-    //     this.logger.log(`Voice Service session created for call=${callId}`);
-    //   }
-    // } catch (error) {
-    //   this.logger.warn(
-    //     `Failed to create Voice Service session for ${callId}: ${(error as Error).message}`,
-    //   );
-    // }
-
+    // Reserve before the first await so duplicate/end events see startup state.
+    const session: AriCallSession = {
+      callId,
+      inboundChannelId: callId,
+      bridgeId: 'bridge-' + callId,
+      externalMediaChannelId: 'extmedia-' + callId,
+      createdAt: new Date().toISOString(),
+      ended: false,
+      mediaReady: false,
+      hangupInbound: false,
+      turns: new PhoneTurnLatency(callId),
+    };
+    this.sessions.set(callId, session);
+    session.startup = this.initializePhoneCall(session);
     try {
-      this.logger.log(`[${callId}] Step 1: Answering channel ${channelId}`);
-      CallLatency.mark(callId, 'T2', 'answer() called');
-      await this.answerChannel(channelId);
-      CallLatency.mark(callId, 'T3', 'Answer HTTP request completed');
-      this.logger.log(`[${callId}] Step 2: Creating bridge ${bridgeId}`);
-      CallLatency.mark(callId, 'T4', 'Bridge creation starts');
-      await this.createBridge(bridgeId);
-      CallLatency.mark(callId, 'T5', 'Bridge created');
-      this.logger.log(
-        `[${callId}] Step 3: Adding channel ${channelId} to bridge`,
-      );
-      await this.addChannelToBridge(bridgeId, channelId);
-      CallLatency.mark(
-        callId,
-        'INBOUND_JOINED',
-        'Inbound channel added to bridge',
-      );
+      await session.startup;
+    } catch {
+      if (!session.ended)
+        this.logger.warn('ARI startup failed for call=' + callId);
+      await this.cleanupSession(callId, !session.ended);
+    }
+  }
 
-      // Use WebSocket externalMedia instead of RTP
-      this.logger.log(
-        `[${callId}] Step 4: Creating WebSocket externalMedia channel`,
-      );
-      CallLatency.mark(
-        callId,
-        'T6',
-        'External media creation starts (UDP/RTP ulaw)',
-      );
-      const externalMediaChannelId =
-        await this.createWebSocketExternalMediaChannel(callId);
-      CallLatency.mark(
-        callId,
-        'T7',
-        'External media creation HTTP request completed',
-      );
+  private assertCallActive(session: AriCallSession) {
+    if (session.ended || this.sessions.get(session.callId) !== session) {
+      throw new Error('Call ended during startup');
+    }
+  }
 
-      if (externalMediaChannelId) {
-        this.logger.log(
-          `[${callId}] Step 5: Adding externalMedia channel ${externalMediaChannelId} to bridge`,
-        );
-        await this.addChannelToBridge(bridgeId, externalMediaChannelId);
+  private async initializePhoneCall(session: AriCallSession) {
+    const { callId, inboundChannelId, bridgeId } = session;
+    CallLatency.mark(callId, 'T2', 'answer() called');
+    await this.answerChannel(inboundChannelId);
+    CallLatency.mark(callId, 'T3', 'Answer HTTP request completed');
+    this.assertCallActive(session);
+
+    // Independent of ARI media creation; handlers gate greeting/audio on readiness.
+    this.ariRtpMediaService.registerCallSession(callId, true);
+    this.startAiSession(callId, this.getDefaultAiInstructions());
+    session.turns.logConfig();
+    this.assertCallActive(session);
+    CallLatency.mark(callId, 'T4', 'Bridge creation starts');
+    await this.createBridge(bridgeId);
+    CallLatency.mark(callId, 'T5', 'Bridge created');
+    this.assertCallActive(session);
+    await this.addChannelToBridge(bridgeId, inboundChannelId);
+    this.assertCallActive(session);
+    CallLatency.mark(
+      callId,
+      'INBOUND_JOINED',
+      'Inbound channel added to bridge',
+    );
+    CallLatency.mark(
+      callId,
+      'T6',
+      'External media creation starts (UDP/RTP ulaw)',
+    );
+    const externalChannelId =
+      await this.createWebSocketExternalMediaChannel(callId);
+    CallLatency.mark(
+      callId,
+      'T7',
+      'External media creation HTTP request completed',
+    );
+    if (
+      !externalChannelId ||
+      externalChannelId !== session.externalMediaChannelId
+    ) {
+      throw new Error('Unexpected external media channel ID');
+    }
+    this.assertCallActive(session);
+
+    // Channel membership and RTP endpoint lookup are genuinely independent.
+    // Wait for both to settle before cleanup, including on either branch's failure.
+    const results = await Promise.allSettled([
+      this.addChannelToBridge(bridgeId, externalChannelId).then(() => {
+        this.assertCallActive(session);
         CallLatency.mark(
           callId,
           'MEDIA_JOINED',
           'External media added to bridge',
         );
-      }
-
-      this.logger.log(`[${callId}] Step 6: Setting up session data`);
-      this.sessions.set(callId, {
-        callId,
-        inboundChannelId: channelId,
-        bridgeId,
-        externalMediaChannelId,
-        createdAt: new Date().toISOString(),
-      });
-
-      this.logger.log(`[${callId}] Step 7: Registering with RTP service`);
-      // Register with RTP for backward compatibility but use WebSocket for audio
-      this.ariRtpMediaService.registerCallSession(callId);
-      this.logger.log(`[${callId}] Step 8: Starting AI session`);
-      this.startAiSession(callId, aiInstructions);
-
-      this.logger.log(
-        `ARI bridge ready. call=${callId} bridge=${bridgeId} wsExtMedia=${externalMediaChannelId || 'none'}`,
-      );
-    } catch (error) {
-      this.logger.error(
-        `Failed to initialize ARI call bridge for ${callId}: ${(error as Error).message}`,
-      );
-      CallLatency.end(callId);
+      }),
+      this.bindPhoneRtpEndpoint(session, externalChannelId),
+    ]);
+    for (const result of results) {
+      if (result.status === 'rejected') throw result.reason;
     }
+    this.assertCallActive(session);
+    session.mediaReady = true;
+    CallLatency.mark(
+      callId,
+      'MEDIA_READY',
+      'Bridge and call-specific RTP destination ready',
+    );
+    this.activatePhoneAudio(callId);
+  }
+
+  private async bindPhoneRtpEndpoint(
+    session: AriCallSession,
+    channelId: string,
+  ) {
+    const variablePath =
+      '/channels/' + encodeURIComponent(channelId) + '/variable';
+    const results = await Promise.allSettled([
+      this.ariRequest<{ value: string }>('get', variablePath, {
+        variable: 'UNICASTRTP_LOCAL_ADDRESS',
+      }),
+      this.ariRequest<{ value: string }>('get', variablePath, {
+        variable: 'UNICASTRTP_LOCAL_PORT',
+      }),
+    ]);
+    const [address, port] = results;
+    if (address.status === 'rejected' || port.status === 'rejected') {
+      throw new Error('Cannot obtain call-specific RTP endpoint');
+    }
+    this.assertCallActive(session);
+    this.ariRtpMediaService.setRemoteEndpoint(
+      session.callId,
+      address.value.value,
+      Number(port.value.value),
+    );
+    CallLatency.mark(
+      session.callId,
+      'RTP_BOUND',
+      'Call-specific RTP destination registered',
+    );
   }
 
   private async handleChannelCleanup(event: AriEvent) {
@@ -315,58 +358,136 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
     return undefined;
   }
 
-  private async cleanupSession(callId: string) {
-    if (this.cleanupInProgress.has(callId)) {
-      return;
-    }
-    this.cleanupInProgress.add(callId);
-
+  private cleanupSession(callId: string, hangupInbound = false): Promise<void> {
     const session = this.sessions.get(callId);
-    if (!session) {
-      this.cleanupAiSession(callId);
-      this.cleanupInProgress.delete(callId);
-      return;
-    }
-
-    this.logger.log(`Cleaning up ARI session for call=${callId}`);
-
-    if (session.externalMediaChannelId) {
-      await this.safeHangupChannel(session.externalMediaChannelId);
-    }
-    await this.safeDestroyBridge(session.bridgeId);
-    this.ariRtpMediaService.unregisterCallSession(callId);
+    if (!session) return Promise.resolve();
+    session.hangupInbound ||= hangupInbound;
+    if (session.cleanup) return session.cleanup;
+    // Cancel locally before waiting for any in-flight ARI request.
+    session.ended = true;
+    session.turns.close();
     this.cleanupAiSession(callId);
-    this.sessions.delete(callId);
-    CallLatency.end(callId);
-    this.cleanupInProgress.delete(callId);
+    this.ariRtpMediaService.unregisterCallSession(callId);
+    session.cleanup = (async () => {
+      // Release a failed call immediately; late ARI resources are still reclaimed below.
+      const earlyHangup = session.hangupInbound
+        ? this.safeHangupChannel(session.inboundChannelId)
+        : null;
+      // A request already accepted by Asterisk may create a resource after hangup.
+      // Wait for startup to settle, then delete the deterministic resource IDs.
+      await session.startup?.catch(() => {});
+      if (session.externalMediaChannelId) {
+        await this.safeHangupChannel(session.externalMediaChannelId);
+      }
+      await this.safeDestroyBridge(session.bridgeId);
+      if (earlyHangup) await earlyHangup;
+      else if (session.hangupInbound)
+        await this.safeHangupChannel(session.inboundChannelId);
+      if (this.sessions.get(callId) === session) this.sessions.delete(callId);
+      CallLatency.end(callId);
+    })();
+    return session.cleanup;
   }
 
-  private handleInboundRtpFrame(callId: string, ulawPayload: Buffer) {
+  private handleInboundRtpFrame(
+    callId: string,
+    ulawPayload: Buffer,
+    receivedAtMs?: number,
+  ) {
+    const call = this.sessions.get(callId);
+    const ai = this.aiSessions.get(callId);
+    if (!call || call.ended || !ai || ai.closed || ai.processingAudio) return;
     CallLatency.mark(callId, 'T12', 'First caller RTP audio received');
-    // Keep RTP handler for backward compatibility but prioritize WebSocket
-    const aiSession = this.aiSessions.get(callId);
-    if (
-      !aiSession ||
-      aiSession.closed ||
-      aiSession.ws.readyState !== WebSocket.OPEN ||
-      aiSession.processingAudio // Don't use RTP if WebSocket is active
-    ) {
+    call.turns.input(ulawPayload, receivedAtMs);
+    if (!ai.ready || !call.mediaReady || ai.ws.readyState !== WebSocket.OPEN) {
+      if (
+        ai.pendingInputBytes + ulawPayload.length >
+        this.maxStartupAudioBytes
+      ) {
+        this.failPhoneCall(callId, 'INPUT_BUFFER_LIMIT');
+        return;
+      }
+      ai.pendingInput.push(Buffer.from(ulawPayload));
+      ai.pendingInputBytes += ulawPayload.length;
+      CallLatency.mark(
+        callId,
+        'INPUT_BUFFERED',
+        'Caller audio buffered until session/media ready',
+      );
       return;
     }
+    this.forwardPhoneAudio(callId, ai, ulawPayload);
+  }
 
+  private forwardPhoneAudio(callId: string, ai: AiSession, payload: Buffer) {
     try {
-      aiSession.ws.send(
+      ai.ws.send(
         JSON.stringify({
           type: 'session.input_audio.append',
-          audio: ulawPayload.toString('base64'),
+          audio: payload.toString('base64'),
         }),
       );
       CallLatency.mark(callId, 'T13', 'First caller audio forwarded to AI');
-    } catch (error) {
-      this.logger.warn(
-        `Failed to send inbound RTP frame to AI for call=${callId}: ${(error as Error).message}`,
-      );
+    } catch {
+      this.failPhoneCall(callId, 'INPUT_SEND_FAILED');
     }
+  }
+
+  private activatePhoneAudio(callId: string) {
+    const call = this.sessions.get(callId);
+    const ai = this.aiSessions.get(callId);
+    if (
+      !call ||
+      call.ended ||
+      !call.mediaReady ||
+      !ai ||
+      ai.closed ||
+      !ai.ready ||
+      ai.ws.readyState !== WebSocket.OPEN
+    )
+      return;
+    try {
+      if (!ai.greetingSent) {
+        ai.greetingSent = true;
+        ai.ws.send(
+          JSON.stringify({
+            type: 'session.instructions.append',
+            delegation_id: null,
+            content:
+              'Greet the caller now in English as Chloe from LeMans Entertainment. Welcome them warmly, introduce yourself, ask how you can help, then pause and listen.',
+          }),
+        );
+        CallLatency.mark(callId, 'GREETING', 'Greeting instruction sent');
+      }
+      // Preserve ordered startup speech; no input is sent before session.started.
+      for (const audio of ai.pendingInput) {
+        if (call.ended) break;
+        this.forwardPhoneAudio(callId, ai, audio);
+      }
+      ai.pendingInput = [];
+      ai.pendingInputBytes = 0;
+      for (const audio of ai.pendingOutput) {
+        if (call.ended) break;
+        this.ariRtpMediaService.sendUlawToCall(callId, audio);
+      }
+      ai.pendingOutput = [];
+      ai.pendingOutputBytes = 0;
+    } catch {
+      this.failPhoneCall(callId, 'GREETING_SEND_FAILED');
+    }
+  }
+
+  private failPhoneCall(callId: string, reason: string) {
+    const call = this.sessions.get(callId);
+    if (!call || call.ended) return;
+    CallLatency.event(callId, 'CALL_FAILED', { reason });
+    this.logger.warn(
+      'Phone pipeline failed call=' +
+        JSON.stringify(callId) +
+        ' reason=' +
+        reason,
+    );
+    void this.cleanupSession(callId, true);
   }
 
   /**
@@ -492,147 +613,160 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
   }
 
   private startAiSession(callId: string, instructions: string) {
+    if (this.aiSessions.has(callId)) return;
     const apiKey = this.configService.get<string>('OPENAI_API_KEY');
-    if (!apiKey) {
-      this.logger.warn(
-        `OPENAI_API_KEY missing. AI pipeline disabled for call=${callId}`,
-      );
-      return;
-    }
-
-    const model = 'gpt-live-1';
-    const wsUrl = 'wss://api.openai.com/v1/live/sessions';
-
+    if (!apiKey) throw new Error('OPENAI_API_KEY missing');
     CallLatency.mark(callId, 'T8', 'AI WebSocket connection starts');
-    const ws = new WebSocket(wsUrl, {
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-      },
+    const ws = new WebSocket('wss://api.openai.com/v1/live/sessions', {
+      headers: { Authorization: 'Bearer ' + apiKey },
+      handshakeTimeout: 10_000,
     });
-
-    const aiSession: AiSession = {
+    const ai: AiSession = {
       callId,
       ws,
       closed: false,
-      processingAudio: false, // Initialize WebSocket audio flag
+      processingAudio: false,
+      ready: false,
+      greetingSent: false,
+      pendingInput: [],
+      pendingInputBytes: 0,
+      pendingOutput: [],
+      pendingOutputBytes: 0,
+      startupTimer: setTimeout(
+        () => this.failPhoneCall(callId, 'GPT_STARTUP_TIMEOUT'),
+        15_000,
+      ),
     };
-    this.aiSessions.set(callId, aiSession);
-
+    ai.startupTimer?.unref();
+    this.aiSessions.set(callId, ai);
     ws.on('open', () => {
+      if (
+        ai.closed ||
+        this.sessions.get(callId)?.ended ||
+        this.aiSessions.get(callId) !== ai
+      )
+        return;
       CallLatency.mark(callId, 'T9', 'AI WebSocket connected');
-      this.logger.log(`GPT-Live connected for call=${callId} (model=${model})`);
-
-      ws.send(
-        JSON.stringify({
-          type: 'session.start',
-          session: {
-            model,
-            instructions,
-            audio: {
-              format: { type: 'audio/pcmu', rate: 8000 },
-              output: { voice: this.configService.get<string>('OPENAI_LIVE_VOICE') ?? 'quartz' },
+      try {
+        // Preserve the working Live protocol, prompt, voice and delegation settings.
+        ws.send(
+          JSON.stringify({
+            type: 'session.start',
+            session: {
+              model: 'gpt-live-1',
+              instructions,
+              audio: {
+                format: { type: 'audio/pcmu', rate: 8000 },
+                output: {
+                  voice:
+                    this.configService.get<string>('OPENAI_LIVE_VOICE') ??
+                    'quartz',
+                },
+              },
+              delegation: { type: 'client' },
             },
-            delegation: { type: 'client' },
-          },
-        }),
-      );
-      CallLatency.mark(callId, 'T10', 'AI session configuration sent');
-    });
-
-    ws.on('message', (rawData: WebSocket.RawData) => {
-      this.handleAiRealtimeEvent(callId, rawData.toString());
-    });
-
-    ws.on('error', (error) => {
-      this.logger.warn(
-        `GPT-Live error for call=${callId}: ${error.message}`,
-      );
-    });
-
-    ws.on('close', () => {
-      const session = this.aiSessions.get(callId);
-      if (session) {
-        session.closed = true;
+          }),
+        );
+        CallLatency.mark(callId, 'T10', 'AI session configuration sent');
+        CallLatency.event(callId, 'VAD_CONFIG', {
+          source: 'session.start',
+          mode: 'GPT-Live managed',
+          turn_detection: 'omitted',
+          threshold: 'omitted',
+          prefix_padding_ms: 'omitted',
+          silence_duration_ms: 'omitted',
+          eagerness: 'omitted',
+          create_response: 'omitted',
+          interrupt_response: 'omitted',
+          provider_speech_boundaries: 'not_exposed',
+          provider_response_lifecycle: 'not_exposed',
+        });
+      } catch {
+        this.failPhoneCall(callId, 'SESSION_START_SEND_FAILED');
       }
-      this.aiSessions.delete(callId);
-      this.logger.log(`GPT-Live closed for call=${callId}`);
+    });
+    ws.on('message', (data: WebSocket.RawData) => {
+      if (!ai.closed && this.aiSessions.get(callId) === ai)
+        this.handleAiRealtimeEvent(callId, data.toString());
+    });
+    ws.on('error', () => this.failPhoneCall(callId, 'GPT_WEBSOCKET_ERROR'));
+    ws.on('close', () => {
+      if (!ai.closed && this.aiSessions.get(callId) === ai)
+        this.failPhoneCall(callId, 'GPT_WEBSOCKET_CLOSED');
     });
   }
 
   private handleAiRealtimeEvent(callId: string, rawEvent: string) {
-    const aiSession = this.aiSessions.get(callId);
-    if (!aiSession) {
-      return;
-    }
-
+    const ai = this.aiSessions.get(callId);
+    const call = this.sessions.get(callId);
+    if (!ai || ai.closed || !call || call.ended) return;
     try {
-      const event = JSON.parse(rawEvent) as {
-        type?: string;
-        delta?: string;
-        error?: { message?: string };
-      };
-
+      const event = JSON.parse(rawEvent) as { type?: string; delta?: string };
       switch (event.type) {
         case 'session.started':
+          if (ai.ready) return;
+          ai.ready = true;
+          if (ai.startupTimer) clearTimeout(ai.startupTimer);
+          ai.startupTimer = null;
           CallLatency.mark(callId, 'T11', 'AI session ready');
-          this.logger.log(`[${callId}] GPT-Live session started — triggering greeting`);
-          aiSession.ws.send(JSON.stringify({
-            type: 'session.instructions.append',
-            delegation_id: null,
-            content: 'Greet the caller now in English as Chloe from LeMans Entertainment. Welcome them warmly, introduce yourself, ask how you can help, then pause and listen.',
-          }));
-          CallLatency.mark(callId, 'GREETING', 'Greeting instruction sent');
+          this.activatePhoneAudio(callId);
           break;
         case 'session.input_transcript.delta':
           this.handleBargeIn(callId);
           break;
-        case 'session.output_audio.delta':
-          if (!event.delta) {
-            return;
-          }
-
+        case 'session.output_audio.delta': {
+          if (!event.delta) return;
           CallLatency.mark(callId, 'T14', 'First AI audio delta received');
-          // Convert base64 ulaw to buffer
-          const ulawBuffer = Buffer.from(event.delta, 'base64');
-
-          this.logger.log(
-            `[${callId}] AI speaking: ${ulawBuffer.length} bytes of audio`,
-          );
-
-          // If WebSocket is active, send via WebSocket, otherwise use RTP
-          if (aiSession.processingAudio) {
-            // Convert ulaw to slin for WebSocket
-            const slinBuffer = this.convertUlawToSlin(ulawBuffer);
-            if (this.ariWebSocketGateway.sendAudioToCall(callId, slinBuffer)) {
+          call.turns.output();
+          const audio = Buffer.from(event.delta, 'base64');
+          if (ai.processingAudio) {
+            const slin = this.convertUlawToSlin(audio);
+            if (this.ariWebSocketGateway.sendAudioToCall(callId, slin)) {
               CallLatency.mark(
                 callId,
                 'T15',
                 'First AI audio handed to Asterisk WebSocket',
               );
             }
-            this.logger.log(
-              `[${callId}] Sent audio via WebSocket: ${slinBuffer.length} bytes`,
+          } else if (!call.mediaReady || !ai.ready) {
+            if (
+              ai.pendingOutputBytes + audio.length >
+              this.maxStartupAudioBytes
+            ) {
+              this.failPhoneCall(callId, 'OUTPUT_BUFFER_LIMIT');
+              return;
+            }
+            ai.pendingOutput.push(audio);
+            ai.pendingOutputBytes += audio.length;
+            CallLatency.mark(
+              callId,
+              'OUTPUT_BUFFERED',
+              'GPT audio buffered until media/session ready',
             );
           } else {
-            // Use RTP for backward compatibility
-            this.ariRtpMediaService.sendUlawToCall(callId, ulawBuffer);
-            this.logger.log(
-              `[${callId}] Sent audio via RTP: ${ulawBuffer.length} bytes`,
-            );
+            this.ariRtpMediaService.sendUlawToCall(callId, audio);
           }
           break;
+        }
         case 'error':
-          this.logger.warn(
-            `AI event error for call=${callId}: ${event.error?.message || 'unknown'}`,
-          );
+          // Never print the provider payload: it can quote conversation content.
+          this.failPhoneCall(callId, 'GPT_SESSION_ERROR');
+          break;
+        case 'session.closed':
+          this.failPhoneCall(callId, 'GPT_SESSION_CLOSED');
           break;
         default:
-          break;
+          // Event types only, one per call, to detect protocol capability changes.
+          if (event.type && /^[a-z0-9_.]{1,100}$/.test(event.type)) {
+            CallLatency.mark(
+              callId,
+              'PROVIDER_EVENT:' + event.type,
+              'Provider event type=' + event.type,
+            );
+          }
       }
-    } catch (error) {
-      this.logger.warn(
-        `Failed to parse AI event for call=${callId}: ${(error as Error).message}`,
-      );
+    } catch {
+      this.failPhoneCall(callId, 'GPT_EVENT_PROCESSING_FAILED');
     }
   }
 
@@ -653,6 +787,12 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
     }
 
     aiSession.closed = true;
+    if (aiSession.startupTimer) clearTimeout(aiSession.startupTimer);
+    aiSession.startupTimer = null;
+    aiSession.pendingInput = [];
+    aiSession.pendingOutput = [];
+    aiSession.pendingInputBytes = 0;
+    aiSession.pendingOutputBytes = 0;
     try {
       if (aiSession.ws.readyState === WebSocket.OPEN) {
         aiSession.ws.close();
@@ -717,9 +857,11 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
       this.configService.get<string>('ASTERISK_EXTERNAL_MEDIA_HOST') ||
       '127.0.0.1:6001';
 
-    this.logger.log(`[${callId}] Creating externalMedia with host=${externalHost}`);
+    this.logger.log(
+      `[${callId}] Creating externalMedia with host=${externalHost}`,
+    );
 
-    const response = await this.ariRequest<any>(
+    const response = await this.ariRequest<{ id?: string }>(
       'post',
       '/channels/externalMedia',
       {

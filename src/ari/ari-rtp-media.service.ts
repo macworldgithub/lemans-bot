@@ -7,6 +7,8 @@ import {
 import { ConfigService } from '@nestjs/config';
 import dgram, { RemoteInfo, Socket } from 'dgram';
 import { CallLatency } from './call-latency';
+import { isIP } from 'node:net';
+import { performance } from 'node:perf_hooks';
 
 type RemoteEndpoint = {
   address: string;
@@ -16,6 +18,7 @@ type RemoteEndpoint = {
 type RtpSession = {
   callId: string;
   remote?: RemoteEndpoint;
+  explicitRemote: boolean;
   packetsRx: number;
   bytesRx: number;
   lastPacketAt?: string;
@@ -29,6 +32,7 @@ type RtpSession = {
 type AudioFrameHandler = (frame: {
   callId: string;
   payload: Buffer;
+  receivedAtMs: number;
   sequenceNumber: number;
   timestamp: number;
   marker: boolean;
@@ -42,6 +46,16 @@ export class AriRtpMediaService implements OnModuleInit, OnModuleDestroy {
   private readonly sessions = new Map<string, RtpSession>();
   private readonly remoteKeyToCallId = new Map<string, string>();
   private onAudioFrameHandler: AudioFrameHandler | null = null;
+  private onStartupFailure: ((callId: string, reason: string) => void) | null =
+    null;
+  private readonly pendingPackets = new Map<
+    string,
+    {
+      remote: RemoteInfo;
+      packets: { packet: Buffer; receivedAtMs: number }[];
+      bytes: number;
+    }
+  >();
 
   constructor(private readonly configService: ConfigService) {}
 
@@ -50,6 +64,9 @@ export class AriRtpMediaService implements OnModuleInit, OnModuleDestroy {
   }
 
   onModuleDestroy() {
+    for (const callId of this.sessions.keys())
+      this.unregisterCallSession(callId);
+    this.pendingPackets.clear();
     if (this.socket) {
       this.socket.close();
       this.socket = null;
@@ -69,13 +86,54 @@ export class AriRtpMediaService implements OnModuleInit, OnModuleDestroy {
     this.onAudioFrameHandler = handler;
   }
 
-  registerCallSession(callId: string) {
+  setStartupFailureHandler(handler: (callId: string, reason: string) => void) {
+    this.onStartupFailure = handler;
+  }
+
+  setRemoteEndpoint(callId: string, address: string, port: number) {
+    const session = this.sessions.get(callId);
+    if (!session) throw new Error('RTP call no longer active');
+    if (
+      isIP(address) !== 4 ||
+      address === '0.0.0.0' ||
+      !Number.isInteger(port) ||
+      port < 1 ||
+      port > 65535
+    ) {
+      throw new Error('Invalid Asterisk RTP endpoint');
+    }
+    const key = this.toRemoteKey({ address, port });
+    const owner = this.remoteKeyToCallId.get(key);
+    if (owner && owner !== callId)
+      throw new Error('RTP endpoint already owned by another call');
+    if (session.remote)
+      this.remoteKeyToCallId.delete(this.toRemoteKey(session.remote));
+    session.remote = { address, port };
+    this.remoteKeyToCallId.set(key, callId);
+    const pending = this.pendingPackets.get(key);
+    this.pendingPackets.delete(key);
+    if (pending) {
+      for (const { packet, receivedAtMs } of pending.packets) {
+        this.handleIncomingPacket(packet, pending.remote, receivedAtMs);
+      }
+    }
+    if (
+      ![...this.sessions.values()].some(
+        (call) => call.explicitRemote && !call.remote,
+      )
+    ) {
+      this.pendingPackets.clear();
+    }
+  }
+
+  registerCallSession(callId: string, explicitRemote = false) {
     if (this.sessions.has(callId)) {
       return;
     }
 
     this.sessions.set(callId, {
       callId,
+      explicitRemote,
       packetsRx: 0,
       bytesRx: 0,
       txSequence: Math.floor(Math.random() * 65535),
@@ -103,6 +161,13 @@ export class AriRtpMediaService implements OnModuleInit, OnModuleDestroy {
     }
 
     this.sessions.delete(callId);
+    if (
+      ![...this.sessions.values()].some(
+        (call) => call.explicitRemote && !call.remote,
+      )
+    ) {
+      this.pendingPackets.clear();
+    }
     this.logger.log(`RTP session unregistered for call=${callId}`);
   }
 
@@ -198,8 +263,12 @@ export class AriRtpMediaService implements OnModuleInit, OnModuleDestroy {
     });
   }
 
-  private handleIncomingPacket(packet: Buffer, remote: RemoteInfo) {
-    if (packet.length < 12) {
+  private handleIncomingPacket(
+    packet: Buffer,
+    remote: RemoteInfo,
+    receivedAtMs = performance.now(),
+  ) {
+    if (packet.length < 12 || packet[0] >> 6 !== 2) {
       return;
     }
 
@@ -212,6 +281,7 @@ export class AriRtpMediaService implements OnModuleInit, OnModuleDestroy {
     if (!callId) {
       callId = this.bindRemoteToPendingSession(remote.address, remote.port);
       if (!callId) {
+        this.bufferPendingPacket(remoteKey, packet, remote, receivedAtMs);
         return;
       }
     }
@@ -246,6 +316,7 @@ export class AriRtpMediaService implements OnModuleInit, OnModuleDestroy {
       this.onAudioFrameHandler({
         callId,
         payload,
+        receivedAtMs,
         sequenceNumber,
         timestamp,
         marker,
@@ -254,12 +325,40 @@ export class AriRtpMediaService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  private bufferPendingPacket(
+    key: string,
+    packet: Buffer,
+    remote: RemoteInfo,
+    receivedAtMs: number,
+  ) {
+    const pendingCalls = [...this.sessions.values()].filter(
+      (call) => call.explicitRemote && !call.remote,
+    );
+    if (!pendingCalls.length) return;
+    let pending = this.pendingPackets.get(key);
+    // Bound unaffiliated packets during endpoint lookup; overflow fails startup explicitly.
+    if (
+      (!pending && this.pendingPackets.size >= 16) ||
+      (pending?.bytes ?? 0) + packet.length > 80_000
+    ) {
+      for (const call of pendingCalls)
+        this.onStartupFailure?.(call.callId, 'RTP_STARTUP_BUFFER_LIMIT');
+      return;
+    }
+    if (!pending) {
+      pending = { remote, packets: [], bytes: 0 };
+      this.pendingPackets.set(key, pending);
+    }
+    pending.packets.push({ packet: Buffer.from(packet), receivedAtMs });
+    pending.bytes += packet.length;
+  }
+
   private bindRemoteToPendingSession(
     address: string,
     port: number,
   ): string | undefined {
     const unboundSession = [...this.sessions.values()].find(
-      (session) => !session.remote,
+      (session) => !session.remote && !session.explicitRemote,
     );
     if (!unboundSession) {
       return undefined;

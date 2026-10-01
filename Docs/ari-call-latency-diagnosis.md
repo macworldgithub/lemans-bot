@@ -1,81 +1,114 @@
-# ARI call latency diagnosis
+# Production phone-call startup optimization
 
-Status: code traced; temporary instrumentation added; reported five-second symptom not reproduced with a live call. No behavioral optimization applied without a measured root cause.
+Scope: DID -> SIP provider -> 3CX -> 8888 -> Asterisk -> Stasis(lemans-bot) -> AriService -> GPT-Live -> RTP -> caller. No VoiceGateway, VoiceService, browser/frontend testing, telephony configuration, ports, NAT or firewall changes.
 
-## Actual ingress and flow
+## 1. Measured bottleneck
 
-`AriService.onModuleInit` registers audio callbacks and opens one ARI event WebSocket at startup only when ASTERISK_ARI_AUTO_CONNECT is true. The HTTP client is constructed once. The configured application is ASTERISK_ARI_APP, default ai-bridge; this instance does not subscribe to lemans-bot unless configured for it.
+The user supplied a real-call baseline of StasisStart -> first RTP = approximately **2427 ms**.
 
-`connectEventSocket` receives StasisStart -> `handleStasisStart` -> `answerChannel` -> `createBridge` -> `addChannelToBridge` (caller) -> `createWebSocketExternalMediaChannel` -> `addChannelToBridge` (external media) -> store session -> register RTP -> `startAiSession` -> WebSocket open -> session.start -> session.started -> session.instructions.append (greeting) -> session.output_audio.delta -> `sendUlawToCall` -> 20 ms RTP drain -> UDP send.
+| Stage | Elapsed from StasisStart | Increment |
+|---|---:|---:|
+| Answer complete (T3) | 12 ms | 12 ms from arrival |
+| Bridge created (T5) | 15 ms | 3 ms after answer |
+| Media joined / GPT starts (T8) | 223 ms | 211 ms after answer |
+| GPT WebSocket open (T9) | 895 ms | 672 ms handshake |
+| Configuration sent (T10) | 897 ms | 2 ms |
+| Session ready / greeting sent (T11) | 1534 ms | 637 ms session initialization |
+| First GPT audio (T14) | 2405 ms | 871 ms greeting generation |
+| First RTP sent (T15) | 2427 ms | 22 ms output pacing |
 
-Despite its name, createWebSocketExternalMediaChannel creates UDP/RTP ulaw media, not a media WebSocket. The separately listening WebSocket gateway is initialized at startup and is not requested by that ARI externalMedia call.
+Answering is fast. The avoidable application dependency was starting GPT only after all ARI media setup. Most latency remains provider connection, session initialization and greeting generation.
 
-First caller audio: RTP socket -> handleIncomingPacket -> bind remote to pending session -> handleInboundRtpFrame -> session.input_audio.append, only if the provider socket is OPEN. Earlier frames are discarded. AI readiness is session.started; there is no session.updated wait and no explicit ARI VAD/silence/endpoint timer. Greeting is requested on readiness and does not wait for caller speech.
+## 2. Changes and code flow
 
-## Findings and limits
+AriService.handleStasisStart reserves call state before its first await. initializePhoneCall still answers first. Once answer completes, it registers RTP startup state and starts GPT immediately. The event-driven GPT WebSocket/session branch progresses while ARI bridge/media setup is awaited.
 
-- Answer is the first awaited operation. No sleeps, retries, remote prompts, credential fetches, subprocesses, database lookups or MCP setup precede it. The VoiceService incoming-call invocation is commented out.
-- Provider connection starts only after five sequential ARI HTTP requests. This definitely adds their cumulative duration to provider startup, but no measured duration is available. Moving startup earlier requires testing greeting/media readiness and hangup/error cleanup; it is not justified as the actual five-second fix yet.
-- The 10,000 ms Axios timeout is a request deadline, not an unconditional wait.
-- RTP output starts on the next 20 ms drain tick once the remote endpoint is known. Output arriving before remote binding is discarded. Remote binding currently picks the first unbound session, a separate concurrent-call correctness risk.
-- Per-audio-chunk informational logging exists and could create logging overhead under load; no measured contribution available.
-- Default external-media destination is port 6001, while RTP listener fallback is 6000. Explicit configuration may reconcile these. A mismatch produces missing audio, not a proven fixed delay. No configuration changed.
-- PbxService.handleIncomingCall has an intentional 6000 ms tradie-answer poll before redirecting to AI. It is a separate HTTP webhook flow; StasisStart does not invoke it. Confirm if production also uses this webhook upstream.
-- Browser VoiceGateway/VoiceService silence timers (10/8 seconds), prewarm expiry (60 seconds), output buffering and CRM/database calls are not used by this ARI call handler.
-- No production call logs or Asterisk/3CX telemetry were available. Code does not establish network connection, session startup or generation durations. The deployed build/application identity must be verified.
+The ARI media branch preserves its existing ordering: create bridge -> add caller -> create externalMedia. Adding externalMedia to the bridge and obtaining its RTP address/port run concurrently, with Promise.allSettled so cleanup cannot outrun an unfinished operation.
 
-## Real-call capture
+bindPhoneRtpEndpoint retrieves UNICASTRTP_LOCAL_ADDRESS and UNICASTRTP_LOCAL_PORT through two concurrent ARI GET /channels/{id}/variable requests. AriRtpMediaService.setRemoteEndpoint associates each call explicitly with that endpoint. This replaces first-pending-call guessing for the production path and allows safe output without waiting for the caller's first RTP packet. Early packets are retained by endpoint until they can be assigned to their call. Original packet-arrival timestamps are retained for diagnostics.
 
-Build and run using the production environment and existing process manager. For a local foreground run:
+activatePhoneAudio requires both session.started and completed bridge/RTP readiness. It sends the same greeting instructions exactly once, forwards buffered caller audio in order, and releases any unexpectedly early GPT output only after readiness. Caller audio is not sent merely because the WebSocket opened.
+
+cleanupSession cancels locally first: mark ended, close GPT, unregister RTP, and clear audio/diagnostic timers. It waits for outstanding startup requests, then deletes deterministic externalMedia/bridge IDs, including resources created after disconnect. Failed calls are hung up promptly. Application shutdown rejects new calls and waits for active startup cleanup.
+
+Startup buffers are bounded; overflow is an explicit pipeline failure, not silent truncation. GPT handshake has a 10-second failure deadline and session startup has a 15-second failure deadline. These deadlines do not delay successful calls. They protect the new concurrent branch from remaining alive indefinitely when its counterpart fails.
+
+## 3. GPT startup and greeting inspection
+
+- One GPT WebSocket per phone call; duplicate events do not create another session. Live conversational sessions are not shared across callers.
+- ARI HTTP client and ARI event connection remain initialized once, rather than per call.
+- session.start contains a short static prompt, PCMU 8 kHz format, configured voice and client delegation. There are no per-call remote prompt/config/credential/database fetches, tool-definition generation or tool list.
+- ConfigService reads are local. No speculative DNS/TLS tuning or preconnected session pool was added; the measured connection duration combines network handshake stages.
+- The greeting remains session.instructions.append, with delegation_id:null, sent after required session.started and media readiness. It is application behavior instructions, not a fabricated user utterance or response.create request.
+- No redundant session.updated wait, initial history or greeting tool setup was found. The business prompt and greeting wording are unchanged, since there is no measured evidence that rewriting them would safely reduce the 871 ms interval.
+- Per-chunk informational audio logs were removed from the phone response handling path; milestone logs remain. No numeric gain is attributed to that reduction.
+
+Official sources: [GPT-Live WebSockets](https://developers.openai.com/api/docs/guides/voice-websockets), [GPT-Live session management](https://developers.openai.com/api/docs/guides/live-conversations), [Asterisk external media and endpoint variables](https://docs.asterisk.org/Development/Reference-Information/Asterisk-Framework-and-API-Examples/External-Media-and-ARI/).
+
+## 4. Expected timing, not a measured improvement
+
+Moving GPT startup from 223 ms to approximately 12 ms overlaps **211 ms** of media setup.
+
+If provider and generation durations repeat, and MEDIA_READY finishes before GPT session readiness:
+
+- T8: approximately 12 ms
+- T9: approximately 684 ms
+- T10: approximately 686 ms
+- T11 / GREETING: approximately 1323 ms
+- T14: approximately 2194 ms
+- T15: approximately **2216 ms**
+
+This is an architectural projection, not a new call measurement. Additional RTP variable lookups must finish before readiness, and network/provider variation may exceed this expected saving. No greeting-generation reduction is claimed.
+
+## 5. Turn logging and protocol limits
+
+T0 through T15 remain, with RTP_BOUND, MEDIA_READY, INPUT_BUFFERED, OUTPUT_BUFFERED and CALL_FAILED milestones. CALL-LATENCY-SUMMARY is printed once when first audio is sent, or at cleanup if the call ends earlier.
+
+Summary fields ending in _ms are milliseconds. answer_ms is T3-T2; media_ready_ms, session_ready_ms and first_rtp_ms are elapsed from T0. gpt_connect_ms is T9-T8; session_init_ms is T11-T10; greeting_first_audio_ms is T14-GREETING. Missing or invalid intervals are null. baseline_first_rtp_ms is 2427.
+
+VAD_CONFIG logs exactly what this production session.start sends: no turn_detection type, threshold, prefix_padding_ms, silence_duration_ms, eagerness, create_response or interrupt_response overrides. All are reported as omitted; provider-resolved thresholds are not known. No Realtime VAD fields were added to the GPT-Live session.
+
+GPT-Live's primary voice stream is continuous/full duplex. Its documented transcript fragments do not delimit completed conversational turns, and output audio deltas have no audio-done event. response.event concerns delegated backend Responses work, not the primary voice response lifecycle.
+
+Therefore:
+
+- USER_SPEECH_STARTED / USER_SPEECH_STOPPED: local PCMU energy estimates, using RMS 600, 80 ms minimum voiced audio, and 300 ms observed silence. These are diagnostics only, not GPT VAD decisions. Noise and short pauses can misclassify them.
+- FIRST_RESPONSE_AUDIO: actual arrival of the first provider audio delta in a locally grouped output burst.
+- RESPONSE_CREATED: explicitly indicates provider_event_unavailable; it does not manufacture a generation-start timestamp.
+- RESPONSE_DONE: output_gap_estimate after 350 ms without a new delta. This is not provider completion or caller playback completion; a pause/network gap may split one utterance.
+- CALL-TURN-SUMMARY: distinguishes initial_greeting from conversation estimates and logs speech_end_to_first_audio_ms relative to the last locally voiced packet arrival, if an end boundary was observed before output. Overlapping speech yields null. speech_end_to_response_ms remains null because the primary protocol does not expose it.
+
+These diagnostic thresholds/timers never delay, gate or modify streaming or GPT turn taking. Provider event types not otherwise handled are logged once per call without payloads, to detect protocol capability changes. Transcripts, audio, prompts, credentials and authorization headers are not logged.
+
+## 6. Verification and risks
+
+Production-focused tests cover startup overlap; readiness gating; duplicate/external channel starts; disconnect during answer, bridge and externalMedia creation; GPT failure; readiness timeout; early caller/GPT audio buffering; endpoint lookup failure with a pending join; concurrent RTP association/replay; RTP pacing; buffer overflow; cleanup and shutdown; honest local speech metrics.
+
+No live call has been made against the modified application here. The next 3CX call must verify normal greeting, immediate caller speech, multiple conversation turns and hangup. Also test two simultaneous calls and a caller hanging up during startup.
+
+The new application dependency is access to Asterisk's documented UNICASTRTP_LOCAL_* variables. There are two extra concurrent REST reads. Missing variables, an invalid endpoint or a NAT topology that makes the reported local endpoint unreachable can cause call failure; no guesses, NAT rewrites or port changes were made. New buffer caps and startup deadlines deliberately fail stalled calls rather than leak resources or drop audio indefinitely. Early speech is now preserved and may legitimately affect the greeting if a caller speaks immediately.
+
+## 7. Collect the next real-call trace
+
+Build/deploy with the existing production configuration and process manager. Do not start a second instance on the same media port. Confirm GET /ari/health reports the instance connected to lemans-bot.
+
+For a foreground PowerShell deployment:
 
 ```powershell
 npm run build
-npm run start:prod 2>&1 | Tee-Object -FilePath call-latency.log
+npm run start:prod 2>&1 | Tee-Object -FilePath phone-call.log
+# Make a real 3CX call, speak immediately, then have two more turns and hang up.
+Select-String -Path phone-call.log -Pattern '\[CALL-LATENCY\]|\[CALL-LATENCY-SUMMARY\]|\[CALL-TURN-SUMMARY\]'
 ```
 
-Then call the DID through 3CX and examine:
-
-```powershell
-Select-String -Path call-latency.log -Pattern '\[CALL-LATENCY\]'
-```
-
-For an existing Linux systemd deployment, replace YOUR_SERVICE with its real unit:
+For an existing systemd service (replace YOUR_SERVICE with the real unit):
 
 ```sh
-journalctl -u YOUR_SERVICE -f -o cat | grep --line-buffered '\[CALL-LATENCY\]'
+journalctl -u YOUR_SERVICE -f -o cat | grep --line-buffered -E '\[CALL-LATENCY\]|\[CALL-LATENCY-SUMMARY\]|\[CALL-TURN-SUMMARY\]'
 ```
 
-GET /ari/health must report connected and the app actually reached by the dialplan. It exposes configured endpoints; do not publish configuration dumps or credentials. If the call reaches lemans-bot while this instance listens to ai-bridge, this instrumentation will not see it.
+Collect the entire call trace, not only its summary: T0-T15, RTP_BOUND, MEDIA_READY, GREETING, VAD_CONFIG, speech/response events, turn summaries and any CALL_FAILED reason. Expect T8 immediately after T3 and before media readiness; GREETING must follow both T11 and MEDIA_READY. Compare first_rtp_ms with the measured **2427 ms** baseline across several calls. Do not claim improvement from mock tests or expected timings.
 
-## Breakdown from one call
+### Local validation result
 
-All records carry ISO timestamps, monotonic milliseconds from T0 and a call/channel ID. Milestones can arrive out of numeric order because media events run independently; each is emitted once per call.
-
-| Portion | Calculate |
-|---|---|
-| Dispatch/answer invocation | T2 - T0 |
-| Answer HTTP completion | T3 - T2 |
-| Bridge creation | T5 - T4 |
-| External-media creation HTTP completion | T7 - T6 |
-| Complete media setup | MEDIA_JOINED - T3 |
-| Provider DNS/TCP/TLS/WebSocket handshake | T9 - T8 |
-| Provider session configuration/readiness | T11 - T10 |
-| Greeting generation until first received audio | T14 - GREETING |
-| AI audio to actual first RTP send | T15 - T14 |
-| Total application first-audio latency | T15 - T0 |
-
-T3 is successful answer REST completion, not an independently observed SIP answer at 3CX. T7 is REST completion, not first packet readiness. T14 is first provider audio received, not provider-internal generation start. T15 confirms local transport send, not caller playback. Use Asterisk SIP/ARI timestamps to measure before T0 and packet/caller observations for after T15. There are no fabricated numeric before/after estimates.
-
-Expected: answer invocation has no intentional wait; HTTP/media operations, provider handshake, session startup and audio generation remain network dependent. Once RTP output is queued, the first packet normally starts on a 20 ms tick, subject to event-loop scheduling. A fast T3 with a late T14/T15 means AI first-response/media latency rather than delayed answering.
-
-Next action: collect one full trace with startup messages and provider errors (redacted), identify the dominant measured interval, then apply and verify the smallest causal fix. Keep diagnostics temporarily as requested.
-
-## Local validation
-
-- TypeScript no-emit check passed.
-- Nest production build passed.
-- Diagnostic milestone isolation/deduplication/cleanup test passed.
-- Newly added diagnostics helper and test pass lint; RTP service passes lint.
-- Existing full test suite: two passed, three failed because the existing VoiceService and Dashboard test modules omit required dependency providers. No ARI behavior is exercised by those failing tests.
-- Existing AriService lint baseline has 22 errors (nine formatting, thirteen other errors). Changes are checked against that baseline rather than changing unrelated code.
-- Live 3CX/Asterisk/provider flow has not been verified. No before/after call-latency measurement or confirmed production root cause is claimed.
+Production-focused ARI test suite: **20 tests passed across four suites**. TypeScript no-emit check and Nest production build passed. RTP service, diagnostics helpers and all new tests are lint-clean. AriService has seven inherited lint findings, down from the pre-change 22; no added lint errors. The final scoped diff passed whitespace checks and was manually reviewed. Existing browser/VoiceGateway/VoiceService files were not changed. Live provider and 3CX verification remains pending the next real phone call.

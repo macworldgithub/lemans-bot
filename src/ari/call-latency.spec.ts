@@ -18,7 +18,11 @@ describe('CallLatency', () => {
       );
       CallLatency.end('call-a');
       CallLatency.mark('call-a', 'T15', 'Late audio');
-      expect(log.mock.calls).toHaveLength(5);
+      expect(
+        log.mock.calls.filter((args) =>
+          String(args[0]).startsWith('[CALL-LATENCY]'),
+        ),
+      ).toHaveLength(5);
       CallLatency.end('call-b');
     } finally {
       log.mockRestore();
