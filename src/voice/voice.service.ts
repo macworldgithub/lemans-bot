@@ -75,7 +75,7 @@ export class VoiceService {
     @InjectModel(Lead.name)
     private readonly leadModel: Model<LeadDocument>,
     private readonly activeCampaign: ActiveCampaignService,
-  ) {}
+  ) { }
 
   // ─── Silence handling ────────────────────────────────────────────────────────
 
@@ -320,16 +320,16 @@ export class VoiceService {
 
     const lead = await this.withToolTimeout(
       this.leadModel.create({
-      callerName: args.caller_name,
-      callerNumber: args.caller_number || session.callerNumber,
-      callerEmail: args.caller_email,
-      eventType: args.event_type,
-      eventDate: args.event_date,
-      groupSize: args.group_size,
-      enquiryDetails: args.enquiry_details,
-      assignedTo,
-      callId: sessionId,
-      source: 'voice_agent',
+        callerName: args.caller_name,
+        callerNumber: args.caller_number || session.callerNumber,
+        callerEmail: args.caller_email,
+        eventType: args.event_type,
+        eventDate: args.event_date,
+        groupSize: args.group_size,
+        enquiryDetails: args.enquiry_details,
+        assignedTo,
+        callId: sessionId,
+        source: 'voice_agent',
       }),
       'database_save',
     );
@@ -358,32 +358,32 @@ export class VoiceService {
 
     this.logger.log(`[${sessionId}] CRM sync started delegation_id=${delegationId}`);
     void this.activeCampaign.createContact({
-        firstName: args.caller_name,
-        phone: args.caller_number || session.callerNumber,
-        email: args.caller_email,
-        tag: activeCampaignTag,
-        fieldValues: [
-          { field: 'EVENT_TYPE',   value: args.event_type ?? '' },
-          { field: 'EVENT_DATE',   value: args.event_date ?? '' },
-          { field: 'GROUP_SIZE',   value: String(args.group_size ?? '') },
-          { field: 'ENQUIRY',      value: args.enquiry_details ?? '' },
-          { field: 'ASSIGNED_TO',  value: assignedTo },
-        ],
-      }).then(() => {
-        this.logger.log(`[${sessionId}] CRM sync completed delegation_id=${delegationId}`);
-      }).catch((err) => {
-        this.logger.warn(`[${sessionId}] CRM sync failed delegation_id=${delegationId} reason=${err instanceof Error ? err.name : 'unknown'}`);
-      });
+      firstName: args.caller_name,
+      phone: args.caller_number || session.callerNumber,
+      email: args.caller_email,
+      tag: activeCampaignTag,
+      fieldValues: [
+        { field: 'EVENT_TYPE', value: args.event_type ?? '' },
+        { field: 'EVENT_DATE', value: args.event_date ?? '' },
+        { field: 'GROUP_SIZE', value: String(args.group_size ?? '') },
+        { field: 'ENQUIRY', value: args.enquiry_details ?? '' },
+        { field: 'ASSIGNED_TO', value: assignedTo },
+      ],
+    }).then(() => {
+      this.logger.log(`[${sessionId}] CRM sync completed delegation_id=${delegationId}`);
+    }).catch((err) => {
+      this.logger.warn(`[${sessionId}] CRM sync failed delegation_id=${delegationId} reason=${err instanceof Error ? err.name : 'unknown'}`);
+    });
 
     const commentaryContent = isCorporateLarge
       ? `I've passed your details straight to Skye. She'll give you a call back personally to plan everything.`
       : args.event_type === 'emergency'
-      ? `I've logged the emergency incident immediately for management. Please go straight to the nearest staff member or Track Marshall on site immediately, or call Triple Zero (000) right away if anyone is in danger or needs urgent medical attention.`
-      : args.event_type === 'complaint'
-      ? `I've logged your complaint for our duty manager. A manager will review your details and contact you directly.`
-      : args.event_type === 'after_hours'
-      ? `The details have been recorded. Our reservations team will give you a call back first thing after 9am.`
-      : `All noted. Someone from the team will give you a call back to go through everything with you.`;
+        ? `I've logged the emergency incident immediately for management. Please go straight to the nearest staff member or Track Marshall on site immediately, or call Triple Zero (000) right away if anyone is in danger or needs urgent medical attention.`
+        : args.event_type === 'complaint'
+          ? `I've logged your complaint for our duty manager. A manager will review your details and contact you directly.`
+          : args.event_type === 'after_hours'
+            ? `The details have been recorded. Our reservations team will give you a call back first thing after 9am.`
+            : `All noted. Someone from the team will give you a call back to go through everything with you.`;
 
     session.ws.send(JSON.stringify({
       type: 'session.commentary.append',
@@ -438,19 +438,19 @@ export class VoiceService {
 
     const eventType: EventType =
       lower.includes('emergency') || lower.includes('injury') || lower.includes('injured') || lower.includes('accident') ? 'emergency'
-      : lower.includes('corporate') || lower.includes('company') || lower.includes('team building') || lower.includes('christmas party') ? 'corporate'
-      : lower.includes('school') || lower.includes('excursion') ? 'school_group'
-      : lower.includes('complaint') || lower.includes('unhappy') || lower.includes('refund') ? 'complaint'
-      : lower.includes('reschedule') || lower.includes('running late') || lower.includes('change') || lower.includes('booking') ? 'booking_change'
-      : lower.includes('teen') ? 'teen_party'
-      : lower.includes('kid') || lower.includes('child') || (lower.includes('birthday') && !lower.includes('18th') && !lower.includes('21st') && !lower.includes('adult')) ? 'kids_party'
-      : lower.includes('buck') || lower.includes('hens') || lower.includes('stag') ? 'buck_party'
-      : lower.includes('adult') || lower.includes('18th') || lower.includes('21st') || lower.includes('social group') ? 'adult_party'
-      : lower.includes('kart') || lower.includes('race') || lower.includes('super kart') || lower.includes('sprint') ? 'karts'
-      : lower.includes('vr') || lower.includes('zero latency') ? 'vr'
-      : lower.includes('laser') || lower.includes('golf') || lower.includes('arcade') ? 'activities'
-      : lower.includes('after hours') || lower.includes('closed') ? 'after_hours'
-      : 'general_enquiry';
+        : lower.includes('corporate') || lower.includes('company') || lower.includes('team building') || lower.includes('christmas party') ? 'corporate'
+          : lower.includes('school') || lower.includes('excursion') ? 'school_group'
+            : lower.includes('complaint') || lower.includes('unhappy') || lower.includes('refund') ? 'complaint'
+              : lower.includes('reschedule') || lower.includes('running late') || lower.includes('change') || lower.includes('booking') ? 'booking_change'
+                : lower.includes('teen') ? 'teen_party'
+                  : lower.includes('kid') || lower.includes('child') || (lower.includes('birthday') && !lower.includes('18th') && !lower.includes('21st') && !lower.includes('adult')) ? 'kids_party'
+                    : lower.includes('buck') || lower.includes('hens') || lower.includes('stag') ? 'buck_party'
+                      : lower.includes('adult') || lower.includes('18th') || lower.includes('21st') || lower.includes('social group') ? 'adult_party'
+                        : lower.includes('kart') || lower.includes('race') || lower.includes('super kart') || lower.includes('sprint') ? 'karts'
+                          : lower.includes('vr') || lower.includes('zero latency') ? 'vr'
+                            : lower.includes('laser') || lower.includes('golf') || lower.includes('arcade') ? 'activities'
+                              : lower.includes('after hours') || lower.includes('closed') ? 'after_hours'
+                                : 'general_enquiry';
 
     const email = transcript.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i)?.[0];
     const phone = transcript.match(/\b(?:\+?61|0)[\s()\d-]{8,14}\d\b/)?.[0]?.replace(/[\s()-]/g, '');
@@ -529,19 +529,19 @@ export class VoiceService {
 
     const eventType: EventType =
       lower.includes('emergency') || lower.includes('injury') || lower.includes('injured') || lower.includes('accident') ? 'emergency'
-      : lower.includes('corporate') || lower.includes('company') || lower.includes('team building') || lower.includes('christmas party') ? 'corporate'
-      : lower.includes('school') || lower.includes('excursion') ? 'school_group'
-      : lower.includes('complaint') || lower.includes('unhappy') || lower.includes('refund') ? 'complaint'
-      : lower.includes('reschedule') || lower.includes('running late') || lower.includes('change') || lower.includes('booking') ? 'booking_change'
-      : lower.includes('teen') ? 'teen_party'
-      : lower.includes('kid') || lower.includes('child') || (lower.includes('birthday') && !lower.includes('18th') && !lower.includes('21st') && !lower.includes('adult')) ? 'kids_party'
-      : lower.includes('buck') || lower.includes('hens') || lower.includes('stag') ? 'buck_party'
-      : lower.includes('adult') || lower.includes('18th') || lower.includes('21st') || lower.includes('social group') ? 'adult_party'
-      : lower.includes('kart') || lower.includes('race') || lower.includes('super kart') || lower.includes('sprint') ? 'karts'
-      : lower.includes('vr') || lower.includes('zero latency') ? 'vr'
-      : lower.includes('laser') || lower.includes('golf') || lower.includes('arcade') ? 'activities'
-      : lower.includes('after hours') || lower.includes('closed') ? 'after_hours'
-      : 'general_enquiry';
+        : lower.includes('corporate') || lower.includes('company') || lower.includes('team building') || lower.includes('christmas party') ? 'corporate'
+          : lower.includes('school') || lower.includes('excursion') ? 'school_group'
+            : lower.includes('complaint') || lower.includes('unhappy') || lower.includes('refund') ? 'complaint'
+              : lower.includes('reschedule') || lower.includes('running late') || lower.includes('change') || lower.includes('booking') ? 'booking_change'
+                : lower.includes('teen') ? 'teen_party'
+                  : lower.includes('kid') || lower.includes('child') || (lower.includes('birthday') && !lower.includes('18th') && !lower.includes('21st') && !lower.includes('adult')) ? 'kids_party'
+                    : lower.includes('buck') || lower.includes('hens') || lower.includes('stag') ? 'buck_party'
+                      : lower.includes('adult') || lower.includes('18th') || lower.includes('21st') || lower.includes('social group') ? 'adult_party'
+                        : lower.includes('kart') || lower.includes('race') || lower.includes('super kart') || lower.includes('sprint') ? 'karts'
+                          : lower.includes('vr') || lower.includes('zero latency') ? 'vr'
+                            : lower.includes('laser') || lower.includes('golf') || lower.includes('arcade') ? 'activities'
+                              : lower.includes('after hours') || lower.includes('closed') ? 'after_hours'
+                                : 'general_enquiry';
 
     const email = transcript.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i)?.[0];
     const phone = transcript.match(/\b(?:\+?61|0)[\s()\d-]{8,14}\d\b/)?.[0]?.replace(/[\s()-]/g, '');
@@ -613,12 +613,13 @@ export class VoiceService {
       const commentaryContent = isCorporateLarge
         ? `I've passed your details straight to Skye. She'll give you a call back personally to plan everything.`
         : eventType === 'emergency'
-        ? `I've logged the emergency incident immediately for management. Please go straight to the nearest staff member or Track Marshall on site immediately, or call Triple Zero (000) right away if anyone is in danger or needs urgent medical attention.`
-        : eventType === 'complaint'
-        ? `I've logged your complaint for our duty manager. A manager will review your details and contact you directly.`
-        : eventType === 'after_hours'
-        ? `The details have been recorded. Our reservations team will give you a call back first thing after 9am.`
-        : `All noted. Someone from the team will give you a call back to go through everything with you.`;
+          ? `I've logged the emergency incident immediately for management. Please go straight to the nearest staff member or Track Marshall on site immediately, or call Triple Zero (000) right away if anyone is in danger or needs urgent medical attention.`
+          : eventType === 'complaint'
+            ? `I've logged your complaint for our duty manager. A manager will review your details and contact you directly.`
+            : eventType === 'after_hours'
+              ? `The details have been recorded. Our reservations team will give you a call back first thing after 9am.`
+              : `All noted. Someone from the team will give you a call back to go through everything with you.`;
+
 
       sendCommentary(commentaryContent);
       this.logger.log(`[${callId}] Tool call completed name=client_delegation delegation_id=${delegationId} duration_ms=${Date.now() - startedAt}`);
