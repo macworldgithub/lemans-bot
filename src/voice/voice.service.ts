@@ -25,6 +25,7 @@ export type EventType =
   | 'complaint'
   | 'after_hours'
   | 'school_group'
+  | 'emergency'
   | 'general_enquiry'
   | 'unknown';
 
@@ -43,22 +44,23 @@ interface RealtimeSession {
   savedLead: boolean;
 }
 
-// Transfer number map — populate from env
+// Transfer number map — populated from env matching Transfer rules destination names
 const TRANSFER_NUMBERS: Record<EventType, string | null> = {
-  kids_party: process.env.TRANSFER_KIDS_PARTY ?? null,
-  teen_party: process.env.TRANSFER_TEEN_PARTY ?? null,
-  buck_party: process.env.TRANSFER_BUCK_PARTY ?? null,
-  corporate: process.env.TRANSFER_CORPORATE ?? null,
-  adult_party: process.env.TRANSFER_ADULT_PARTY ?? null,
-  karts: process.env.TRANSFER_KARTS ?? null,
-  vr: process.env.TRANSFER_VR ?? null,
-  activities: process.env.TRANSFER_ACTIVITIES ?? null,
-  booking_change: process.env.TRANSFER_BOOKING_CHANGE ?? null,
-  complaint: process.env.TRANSFER_COMPLAINT ?? null,
+  emergency: process.env.TRANSFER_EMERGENCY ?? process.env.TRANSFER_DUTY_MANAGER ?? null,
+  kids_party: process.env.TRANSFER_KIDS_PARTY ?? process.env.TRANSFER_RESERVATIONS ?? null,
+  teen_party: process.env.TRANSFER_TEEN_PARTY ?? process.env.TRANSFER_RESERVATIONS ?? null,
+  buck_party: process.env.TRANSFER_BUCK_PARTY ?? process.env.TRANSFER_RESERVATIONS ?? null,
+  corporate: process.env.TRANSFER_CORPORATE ?? process.env.TRANSFER_CORPORATE_SALES ?? null,
+  adult_party: process.env.TRANSFER_ADULT_PARTY ?? process.env.TRANSFER_RESERVATIONS ?? null,
+  karts: process.env.TRANSFER_KARTS ?? process.env.TRANSFER_TRACK ?? process.env.TRANSFER_RESERVATIONS ?? null,
+  vr: process.env.TRANSFER_VR ?? process.env.TRANSFER_RESERVATIONS ?? null,
+  activities: process.env.TRANSFER_ACTIVITIES ?? process.env.TRANSFER_RESERVATIONS ?? null,
+  booking_change: process.env.TRANSFER_BOOKING_CHANGE ?? process.env.TRANSFER_RESERVATIONS ?? null,
+  complaint: process.env.TRANSFER_COMPLAINT ?? process.env.TRANSFER_DUTY_MANAGER ?? null,
   after_hours: null,
-  school_group: process.env.TRANSFER_SCHOOL_GROUP ?? null,
-  general_enquiry: process.env.TRANSFER_GENERAL ?? null,
-  unknown: process.env.TRANSFER_GENERAL ?? null,
+  school_group: process.env.TRANSFER_SCHOOL_GROUP ?? process.env.TRANSFER_RESERVATIONS ?? null,
+  general_enquiry: process.env.TRANSFER_GENERAL ?? process.env.TRANSFER_RESERVATIONS ?? null,
+  unknown: process.env.TRANSFER_GENERAL ?? process.env.TRANSFER_RESERVATIONS ?? null,
 };
 
 @Injectable()
@@ -348,6 +350,7 @@ export class VoiceService {
       complaint: 'Complaint',
       after_hours: 'AfterHours',
       school_group: 'SchoolGroup',
+      emergency: 'Emergency',
       general_enquiry: 'GeneralEnquiry',
       unknown: 'Unknown',
     };
@@ -372,12 +375,20 @@ export class VoiceService {
         this.logger.warn(`[${sessionId}] CRM sync failed delegation_id=${delegationId} reason=${err instanceof Error ? err.name : 'unknown'}`);
       });
 
+    const commentaryContent = isCorporateLarge
+      ? `I've passed your details straight to Skye. She'll give you a call back personally to plan everything.`
+      : args.event_type === 'emergency'
+      ? `I've logged the emergency incident immediately for management. Please go straight to the nearest staff member or Track Marshall on site immediately, or call Triple Zero (000) right away if anyone is in danger or needs urgent medical attention.`
+      : args.event_type === 'complaint'
+      ? `I've logged your complaint for our duty manager. A manager will review your details and contact you directly.`
+      : args.event_type === 'after_hours'
+      ? `The details have been recorded. Our reservations team will give you a call back first thing after 9am.`
+      : `All noted. Someone from the team will give you a call back to go through everything with you.`;
+
     session.ws.send(JSON.stringify({
       type: 'session.commentary.append',
       delegation_id: delegationId,
-      content: isCorporateLarge
-        ? `I've passed your details straight to Skye. She'll give you a call back personally to plan everything.`
-        : `All noted. Someone from the team will give you a call back to go through everything with you.`,
+      content: commentaryContent,
     }));
     session.onEvent({ type: 'lead-saved', data: { ...args, assignedTo } });
   }
@@ -395,7 +406,12 @@ export class VoiceService {
 
     const transcript = session.callerTranscript.trim();
     const lower = transcript.toLowerCase();
-    const wantsFollowUp = /call me back|callback|call back|contact me|speak to (someone|a person|the team)|book(ing)?|quote|complaint|reschedule|change my booking/.test(lower);
+    const hasContactOrName =
+      /\b(?:my name is|name is|name's|i am|i'm|this is|it's|it is|call me)\s+[a-z]/i.test(transcript) ||
+      /\b(?:\+?61|0)[\s()\d-]{8,14}\d\b/.test(transcript);
+    const wantsFollowUp =
+      hasContactOrName ||
+      /call me back|callback|call back|contact me|speak to|talk to|book(ing)?|quote|complaint|reschedule|change|party|bucks|hens|stag|birthday|corporate|company|team building|function|kart|race|track|vr|zero latency|laser|golf|arcade|school|excursion|after hours|hold|deposit|reserve|reservation|manager|refund|late|date|price|cost|how much|emergency|injury/i.test(lower);
     if (!wantsFollowUp) {
       this.logger.log(`[${sessionId}] Tool call completed name=client_delegation delegation_id=${delegationId} result=no_follow_up duration_ms=${Date.now() - startedAt}`);
       session.ws.send(JSON.stringify({
@@ -405,8 +421,12 @@ export class VoiceService {
       return;
     }
 
-    const nameMatch = transcript.match(/\b(?:my name is|i am|i'm|this is)\s+([a-z][a-z' -]{1,50})/i);
-    const callerName = nameMatch?.[1]?.split(/[,.;!?]|\b(?:and|i|we|my|i'd|i would)\b/i)[0]?.trim();
+    const nameMatch = transcript.match(/\b(?:my name is|name is|name's|i am|i'm|this is|it's|it is|call me)\s+([a-z][a-z' -]{1,50})/i);
+    let callerName = nameMatch?.[1]?.split(/[,.;!?]|\b(?:and|i|we|my|i'd|i would|phone|number|mobile|email)\b/i)[0]?.trim();
+    if (!callerName) {
+      const suffixMatch = transcript.match(/\b([a-z][a-z' -]{1,30})\s+(?:here|speaking)\b/i);
+      callerName = suffixMatch?.[1]?.trim();
+    }
     if (!callerName) {
       this.logger.warn(`[${sessionId}] Tool call needs caller name delegation_id=${delegationId} duration_ms=${Date.now() - startedAt}`);
       session.ws.send(JSON.stringify({
@@ -416,17 +436,24 @@ export class VoiceService {
       return;
     }
 
-    const eventType: EventType = lower.includes('corporate') || lower.includes('company') ? 'corporate'
-      : lower.includes('school') ? 'school_group'
-      : lower.includes('complaint') || lower.includes('unhappy') ? 'complaint'
-      : lower.includes('booking') || lower.includes('reschedule') ? 'booking_change'
+    const eventType: EventType =
+      lower.includes('emergency') || lower.includes('injury') || lower.includes('injured') || lower.includes('accident') ? 'emergency'
+      : lower.includes('corporate') || lower.includes('company') || lower.includes('team building') || lower.includes('christmas party') ? 'corporate'
+      : lower.includes('school') || lower.includes('excursion') ? 'school_group'
+      : lower.includes('complaint') || lower.includes('unhappy') || lower.includes('refund') ? 'complaint'
+      : lower.includes('reschedule') || lower.includes('running late') || lower.includes('change') || lower.includes('booking') ? 'booking_change'
       : lower.includes('teen') ? 'teen_party'
-      : lower.includes('kid') || lower.includes('child') || lower.includes('birthday') ? 'kids_party'
-      : lower.includes('buck') || lower.includes('hens') ? 'buck_party'
-      : lower.includes('kart') || lower.includes('race') ? 'karts'
-      : lower.includes('vr') ? 'vr' : 'general_enquiry';
+      : lower.includes('kid') || lower.includes('child') || (lower.includes('birthday') && !lower.includes('18th') && !lower.includes('21st') && !lower.includes('adult')) ? 'kids_party'
+      : lower.includes('buck') || lower.includes('hens') || lower.includes('stag') ? 'buck_party'
+      : lower.includes('adult') || lower.includes('18th') || lower.includes('21st') || lower.includes('social group') ? 'adult_party'
+      : lower.includes('kart') || lower.includes('race') || lower.includes('super kart') || lower.includes('sprint') ? 'karts'
+      : lower.includes('vr') || lower.includes('zero latency') ? 'vr'
+      : lower.includes('laser') || lower.includes('golf') || lower.includes('arcade') ? 'activities'
+      : lower.includes('after hours') || lower.includes('closed') ? 'after_hours'
+      : 'general_enquiry';
+
     const email = transcript.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i)?.[0];
-    const phone = transcript.match(/\b(?:\+?61|0)[\s()\d-]{8,14}\d\b/)?.[0];
+    const phone = transcript.match(/\b(?:\+?61|0)[\s()\d-]{8,14}\d\b/)?.[0]?.replace(/[\s()-]/g, '');
     if ((!phone && session.callerNumber === 'unknown')) {
       this.logger.warn(`[${sessionId}] Tool call needs callback number delegation_id=${delegationId} duration_ms=${Date.now() - startedAt}`);
       session.ws.send(JSON.stringify({
@@ -435,8 +462,8 @@ export class VoiceService {
       }));
       return;
     }
-    const groupSize = Number(transcript.match(/\b(\d{1,3})\s+(?:people|guests|kids|children|attendees)\b/i)?.[1]) || undefined;
-    const eventDate = transcript.match(/\b(?:on|for|around)\s+((?:next\s+)?(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday|\d{1,2}\s+\w+|\w+\s+\d{1,2}))\b/i)?.[1];
+    const groupSize = Number(transcript.match(/\b(\d{1,3})\s+(?:people|guests|kids|children|attendees|drivers|racers|players|guys|girls)\b/i)?.[1]) || undefined;
+    const eventDate = transcript.match(/\b(?:on|for|around|this|next)\s+((?:next\s+)?(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday|\d{1,2}(?:st|nd|rd|th)?\s+(?:of\s+)?\w+|\w+\s+\d{1,2}(?:st|nd|rd|th)?|weekend))\b/i)?.[1];
     const details = transcript.slice(-1600);
 
     session.savedLead = true;
@@ -459,6 +486,146 @@ export class VoiceService {
         type: 'session.commentary.append', delegation_id: delegationId,
         content: 'I could not save the enquiry just now. Apologize briefly and offer the caller the reservations phone number, (03) 8787 8741.',
       }));
+    }
+  }
+
+  public async handleExternalDelegation(params: {
+    callId: string;
+    callerNumber?: string;
+    callerTranscript: string;
+    delegationId: string;
+    sendCommentary: (content: string) => void;
+    sendThinking?: (content: string) => void;
+  }): Promise<void> {
+    const { callId, callerNumber = 'unknown', callerTranscript, delegationId, sendCommentary, sendThinking } = params;
+    const startedAt = Date.now();
+    this.logger.log(`[${callId}] Tool call started name=client_delegation delegation_id=${delegationId}`);
+
+    const transcript = callerTranscript.trim();
+    const lower = transcript.toLowerCase();
+    const hasContactOrName =
+      /\b(?:my name is|name is|name's|i am|i'm|this is|it's|it is|call me)\s+[a-z]/i.test(transcript) ||
+      /\b(?:\+?61|0)[\s()\d-]{8,14}\d\b/.test(transcript);
+    const wantsFollowUp =
+      hasContactOrName ||
+      /call me back|callback|call back|contact me|speak to|talk to|book(ing)?|quote|complaint|reschedule|change|party|bucks|hens|stag|birthday|corporate|company|team building|function|kart|race|track|vr|zero latency|laser|golf|arcade|school|excursion|after hours|hold|deposit|reserve|reservation|manager|refund|late|date|price|cost|how much|emergency|injury/i.test(lower);
+    if (!wantsFollowUp) {
+      this.logger.log(`[${callId}] Tool call completed name=client_delegation delegation_id=${delegationId} result=no_follow_up duration_ms=${Date.now() - startedAt}`);
+      if (sendThinking) sendThinking('No staff follow-up or lead record is needed for this request.');
+      return;
+    }
+
+    const nameMatch = transcript.match(/\b(?:my name is|name is|name's|i am|i'm|this is|it's|it is|call me)\s+([a-z][a-z' -]{1,50})/i);
+    let callerName = nameMatch?.[1]?.split(/[,.;!?]|\b(?:and|i|we|my|i'd|i would|phone|number|mobile|email)\b/i)[0]?.trim();
+    if (!callerName) {
+      const suffixMatch = transcript.match(/\b([a-z][a-z' -]{1,30})\s+(?:here|speaking)\b/i);
+      callerName = suffixMatch?.[1]?.trim();
+    }
+    if (!callerName) {
+      this.logger.warn(`[${callId}] Tool call needs caller name delegation_id=${delegationId} duration_ms=${Date.now() - startedAt}`);
+      sendCommentary('Please ask the caller for their name so the team can follow up, then delegate again once they have answered.');
+      return;
+    }
+
+    const eventType: EventType =
+      lower.includes('emergency') || lower.includes('injury') || lower.includes('injured') || lower.includes('accident') ? 'emergency'
+      : lower.includes('corporate') || lower.includes('company') || lower.includes('team building') || lower.includes('christmas party') ? 'corporate'
+      : lower.includes('school') || lower.includes('excursion') ? 'school_group'
+      : lower.includes('complaint') || lower.includes('unhappy') || lower.includes('refund') ? 'complaint'
+      : lower.includes('reschedule') || lower.includes('running late') || lower.includes('change') || lower.includes('booking') ? 'booking_change'
+      : lower.includes('teen') ? 'teen_party'
+      : lower.includes('kid') || lower.includes('child') || (lower.includes('birthday') && !lower.includes('18th') && !lower.includes('21st') && !lower.includes('adult')) ? 'kids_party'
+      : lower.includes('buck') || lower.includes('hens') || lower.includes('stag') ? 'buck_party'
+      : lower.includes('adult') || lower.includes('18th') || lower.includes('21st') || lower.includes('social group') ? 'adult_party'
+      : lower.includes('kart') || lower.includes('race') || lower.includes('super kart') || lower.includes('sprint') ? 'karts'
+      : lower.includes('vr') || lower.includes('zero latency') ? 'vr'
+      : lower.includes('laser') || lower.includes('golf') || lower.includes('arcade') ? 'activities'
+      : lower.includes('after hours') || lower.includes('closed') ? 'after_hours'
+      : 'general_enquiry';
+
+    const email = transcript.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i)?.[0];
+    const phone = transcript.match(/\b(?:\+?61|0)[\s()\d-]{8,14}\d\b/)?.[0]?.replace(/[\s()-]/g, '');
+    if (!phone && callerNumber === 'unknown') {
+      this.logger.warn(`[${callId}] Tool call needs callback number delegation_id=${delegationId} duration_ms=${Date.now() - startedAt}`);
+      sendCommentary('Please ask the caller for a callback phone number, then delegate again once they have answered.');
+      return;
+    }
+
+    const groupSize = Number(transcript.match(/\b(\d{1,3})\s+(?:people|guests|kids|children|attendees|drivers|racers|players|guys|girls)\b/i)?.[1]) || undefined;
+    const eventDate = transcript.match(/\b(?:on|for|around|this|next)\s+((?:next\s+)?(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday|\d{1,2}(?:st|nd|rd|th)?\s+(?:of\s+)?\w+|\w+\s+\d{1,2}(?:st|nd|rd|th)?|weekend))\b/i)?.[1];
+    const details = transcript.slice(-1600);
+
+    const isCorporateLarge = eventType === 'corporate' && groupSize !== undefined && groupSize > 40;
+    const assignedTo = isCorporateLarge ? 'Skye' : 'LeMans Inquiries';
+
+    try {
+      await this.withToolTimeout(
+        this.leadModel.create({
+          callerName,
+          callerNumber: callerNumber !== 'unknown' ? callerNumber : phone,
+          callerEmail: email,
+          eventType,
+          eventDate,
+          groupSize,
+          enquiryDetails: details,
+          assignedTo,
+          callId,
+          source: 'voice_agent',
+        }),
+        'database_save',
+      );
+
+      const tagMap: Record<string, string> = {
+        kids_party: 'KidsParty',
+        teen_party: 'TeenParty',
+        buck_party: 'BucksHens',
+        corporate: 'Corporate',
+        adult_party: 'AdultParty',
+        karts: 'Karts',
+        vr: 'VR',
+        activities: 'Activities',
+        booking_change: 'BookingChange',
+        complaint: 'Complaint',
+        after_hours: 'AfterHours',
+        school_group: 'SchoolGroup',
+        emergency: 'Emergency',
+        general_enquiry: 'GeneralEnquiry',
+        unknown: 'Unknown',
+      };
+      const activeCampaignTag = tagMap[eventType] || eventType;
+
+      void this.activeCampaign.createContact({
+        firstName: callerName,
+        phone: callerNumber !== 'unknown' ? callerNumber : phone,
+        email,
+        tag: activeCampaignTag,
+        fieldValues: [
+          { field: 'EVENT_TYPE', value: eventType ?? '' },
+          { field: 'EVENT_DATE', value: eventDate ?? '' },
+          { field: 'GROUP_SIZE', value: String(groupSize ?? '') },
+          { field: 'ENQUIRY', value: details ?? '' },
+          { field: 'ASSIGNED_TO', value: assignedTo },
+        ],
+      }).catch((err) => {
+        this.logger.warn(`[${callId}] CRM sync failed delegation_id=${delegationId} reason=${err instanceof Error ? err.name : 'unknown'}`);
+      });
+
+      const commentaryContent = isCorporateLarge
+        ? `I've passed your details straight to Skye. She'll give you a call back personally to plan everything.`
+        : eventType === 'emergency'
+        ? `I've logged the emergency incident immediately for management. Please go straight to the nearest staff member or Track Marshall on site immediately, or call Triple Zero (000) right away if anyone is in danger or needs urgent medical attention.`
+        : eventType === 'complaint'
+        ? `I've logged your complaint for our duty manager. A manager will review your details and contact you directly.`
+        : eventType === 'after_hours'
+        ? `The details have been recorded. Our reservations team will give you a call back first thing after 9am.`
+        : `All noted. Someone from the team will give you a call back to go through everything with you.`;
+
+      sendCommentary(commentaryContent);
+      this.logger.log(`[${callId}] Tool call completed name=client_delegation delegation_id=${delegationId} duration_ms=${Date.now() - startedAt}`);
+    } catch (error) {
+      const timedOut = error instanceof Error && error.message.includes('timed out');
+      this.logger.error(`[${callId}] Tool call ${timedOut ? 'timed out' : 'failed'} name=client_delegation delegation_id=${delegationId} duration_ms=${Date.now() - startedAt}`);
+      sendCommentary('I could not save the enquiry just now. Apologize briefly and offer the caller the reservations phone number, (03) 8787 8741.');
     }
   }
 

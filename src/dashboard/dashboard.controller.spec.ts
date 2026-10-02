@@ -8,7 +8,15 @@ describe('DashboardController', () => {
   beforeEach(async () => {
     const module: TestingModule = await Test.createTestingModule({
       controllers: [DashboardController],
-      providers: [DashboardService],
+      providers: [
+        {
+          provide: DashboardService,
+          useValue: {
+            getStats: jest.fn().mockResolvedValue({ totalLeads: 0, byEventType: [], recentLeads: [] }),
+            getLeads: jest.fn().mockResolvedValue({ leads: [], total: 0, page: 1, limit: 50 }),
+          },
+        },
+      ],
     }).compile();
 
     controller = module.get<DashboardController>(DashboardController);
@@ -18,3 +26,4 @@ describe('DashboardController', () => {
     expect(controller).toBeDefined();
   });
 });
+

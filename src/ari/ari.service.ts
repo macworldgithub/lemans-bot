@@ -43,6 +43,9 @@ type AriCallSession = {
   cleanup?: Promise<void>;
   hangupInbound: boolean;
   turns: PhoneTurnLatency;
+  callerNumber?: string;
+  callerTranscript?: string;
+  savedLead?: boolean;
 };
 
 type AiSession = {
@@ -213,6 +216,9 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
       mediaReady: false,
       hangupInbound: false,
       turns: new PhoneTurnLatency(callId),
+      callerNumber: event.channel?.caller?.number || 'unknown',
+      callerTranscript: '',
+      savedLead: false,
     };
     this.sessions.set(callId, session);
     session.startup = this.initializePhoneCall(session);
@@ -713,17 +719,35 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
           break;
         case 'session.input_transcript.delta':
           this.handleBargeIn(callId);
+          call.callerTranscript = (call.callerTranscript || '') + (event.delta ?? '');
           break;
         case 'session.delegation.created': {
           const delegationId = event.delegation?.id;
-          this.logger.log(`[${callId}] Tool call started name=${event.delegation?.name ?? 'client_delegation'} delegation_id=${delegationId ?? 'unknown'}`);
           if (delegationId && ai.ws.readyState === WebSocket.OPEN) {
-            ai.ws.send(JSON.stringify({
-              type: 'session.commentary.append',
-              delegation_id: delegationId,
-              content: 'This phone session cannot save or route a staff follow-up. Tell the caller that their enquiry could not be submitted here and give them the reservations number, (03) 8787 8741.',
-            }));
-            this.logger.warn(`[${callId}] Tool call completed name=client_delegation delegation_id=${delegationId} result=staff_follow_up_unavailable`);
+            void this.voiceService.handleExternalDelegation({
+              callId,
+              callerNumber: call.callerNumber,
+              callerTranscript: call.callerTranscript || '',
+              delegationId,
+              sendCommentary: (content) => {
+                if (ai.ws.readyState === WebSocket.OPEN) {
+                  ai.ws.send(JSON.stringify({
+                    type: 'session.commentary.append',
+                    delegation_id: delegationId,
+                    content,
+                  }));
+                }
+              },
+              sendThinking: (content) => {
+                if (ai.ws.readyState === WebSocket.OPEN) {
+                  ai.ws.send(JSON.stringify({
+                    type: 'session.thinking.append',
+                    delegation_id: delegationId,
+                    content,
+                  }));
+                }
+              },
+            });
           } else {
             this.logger.warn(`[${callId}] Tool call failed name=client_delegation reason=missing_delegation_id`);
           }
@@ -829,7 +853,7 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
   }
 
   private getDefaultAiInstructions() {
-    return `${this.voiceService.getSystemPrompt()}\nPhone call guidance: Answer Le Mans service and activity questions directly from the knowledge above. Keep answers brief, and stop to listen when interrupted. This phone session cannot save enquiries or arrange staff callbacks. If a caller needs staff follow-up, provide the reservations number (03) 8787 8741.`;
+    return `${this.voiceService.getSystemPrompt()}\n\nGPT-Live telephony guidance: Speak warmly, concisely, and naturally in an Australian voice. Ask one clear question at a time, and stop to listen when interrupted. For callback, quote, booking assistance, party bookings, corporate events, complaints, or other staff follow-up requests, collect the caller’s name, phone number, and enquiry details, then delegate the task to the application to save the enquiry and sync with the CRM.`;
   }
 
   private async answerChannel(channelId: string) {

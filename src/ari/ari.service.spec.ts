@@ -105,7 +105,10 @@ describe('AriService phone startup', () => {
       config,
       rtp as unknown as AriRtpMediaService,
       {} as AriWebSocketGateway,
-      {} as VoiceService,
+      {
+        getSystemPrompt: () => 'System prompt',
+        handleExternalDelegation: jest.fn(),
+      } as unknown as VoiceService,
     );
     api = service as unknown as Harness;
     CallLatency.start('phone');

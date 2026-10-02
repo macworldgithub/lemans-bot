@@ -29,6 +29,7 @@ export class Lead {
       'complaint',
       'after_hours',
       'school_group',
+      'emergency',
       'general_enquiry',
       'unknown',
     ],
