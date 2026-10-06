@@ -374,6 +374,9 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
     session.turns.close();
     this.cleanupAiSession(callId);
     this.ariRtpMediaService.unregisterCallSession(callId);
+    const leadFinalization = this.voiceService.finalizeExternalSession(callId).catch(() => {
+      this.logger.error(`[${callId}] Final lead persistence failed`);
+    });
     session.cleanup = (async () => {
       // Release a failed call immediately; late ARI resources are still reclaimed below.
       const earlyHangup = session.hangupInbound
@@ -389,6 +392,7 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
       if (earlyHangup) await earlyHangup;
       else if (session.hangupInbound)
         await this.safeHangupChannel(session.inboundChannelId);
+      await leadFinalization;
       if (this.sessions.get(callId) === session) this.sessions.delete(callId);
       CallLatency.end(callId);
     })();
@@ -712,6 +716,7 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
         case 'session.started':
           if (ai.ready) return;
           ai.ready = true;
+          this.voiceService.startExternalSession(callId, call.callerNumber);
           if (ai.startupTimer) clearTimeout(ai.startupTimer);
           ai.startupTimer = null;
           CallLatency.mark(callId, 'T11', 'AI session ready');
@@ -720,6 +725,10 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
         case 'session.input_transcript.delta':
           this.handleBargeIn(callId);
           call.callerTranscript = (call.callerTranscript || '') + (event.delta ?? '');
+          this.voiceService.appendExternalTranscript(callId, 'user', event.delta ?? '');
+          break;
+        case 'session.output_transcript.delta':
+          this.voiceService.appendExternalTranscript(callId, 'assistant', event.delta ?? '');
           break;
         case 'session.delegation.created': {
           const delegationId = event.delegation?.id;

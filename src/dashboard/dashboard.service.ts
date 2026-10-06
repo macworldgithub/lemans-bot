@@ -1,12 +1,12 @@
 import { Injectable } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
-import { Lead, LeadDocument } from '../voice/schemas/lead.schema';
+import { LeadDocument, VOICE_LEAD_MODEL } from '../voice/schemas/lead.schema';
 
 @Injectable()
 export class DashboardService {
   constructor(
-    @InjectModel(Lead.name) private readonly leadModel: Model<LeadDocument>,
+    @InjectModel(VOICE_LEAD_MODEL) private readonly leadModel: Model<LeadDocument>,
   ) {}
 
   async getStats() {

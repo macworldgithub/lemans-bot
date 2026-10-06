@@ -48,14 +48,16 @@ export class VoiceGateway
 
   handleConnection(client: Socket) {
     this.logger.log(`Client connected: ${client.id}`);
-    void this.startPrewarm(client);
+    void this.startPrewarm(client).catch(() => {});
   }
 
   handleDisconnect(client: Socket) {
     this.logger.log(`Client disconnected: ${client.id}`);
     this.clearPrewarmState(client.id);
     this.clearSilenceTimer(client.id);
-    this.voiceService.closeSession(client.id);
+    void this.voiceService.closeSession(client.id).catch(() => {
+      this.logger.error(`Final lead save failed after disconnect: ${client.id}`);
+    });
   }
 
   // ─── Session lifecycle ────────────────────────────────────────────────────
@@ -112,12 +114,19 @@ export class VoiceGateway
   }
 
   @SubscribeMessage('end-session')
-  handleEndSession(@ConnectedSocket() client: Socket) {
+  async handleEndSession(@ConnectedSocket() client: Socket) {
     this.logger.log(`[VoiceGateway] Ending session: ${client.id}`);
     this.clearPrewarmState(client.id);
     this.clearSilenceTimer(client.id);
-    this.voiceService.closeSession(client.id);
-    client.emit('session-closed', {});
+    const hadSession = this.voiceService.hasSession(client.id);
+    try {
+      await this.voiceService.closeSession(client.id);
+      if (!hadSession) client.emit('session-closed', {});
+    } catch {
+      client.emit('realtime-error', {
+        error: { message: 'Could not save call details. Please retry End Call.' },
+      });
+    }
   }
 
   /** Start silence monitoring after the browser finishes queued assistant audio. */
@@ -181,7 +190,7 @@ export class VoiceGateway
         `[VoiceGateway] Prewarm TTL expired for ${sessionId}; closing idle session`,
       );
       this.clearPrewarmState(sessionId);
-      this.voiceService.closeSession(sessionId);
+      void this.voiceService.closeSession(sessionId).catch(() => {});
     }, this.prewarmTtlMs);
 
     state = { promise, ready: false, failed: false, ttlTimer };

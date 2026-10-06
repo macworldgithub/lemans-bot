@@ -108,6 +108,9 @@ describe('AriService phone startup', () => {
       {
         getSystemPrompt: () => 'System prompt',
         handleExternalDelegation: jest.fn(),
+        startExternalSession: jest.fn(),
+        appendExternalTranscript: jest.fn(),
+        finalizeExternalSession: jest.fn().mockResolvedValue(undefined),
       } as unknown as VoiceService,
     );
     api = service as unknown as Harness;

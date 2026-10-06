@@ -247,6 +247,7 @@
   let mediaStream = null;
   let workletNode = null;
   let isActive    = false;
+  let ending      = false;
 
   let playQueue = [];
   let playing   = false;
@@ -417,11 +418,12 @@
   });
 
   // Each audio chunk from GPT-Live via the server
-  socket.on('audio-delta', (d) => enqueueAudio(d.delta));
+  socket.on('audio-delta', (d) => { if (!ending) enqueueAudio(d.delta); });
 
   // The server infers stream completion from a short quiet interval. Wait until
   // both that signal and the local playback queue have finished.
   socket.on('audio-done', () => {
+    if (ending) return;
     audioStreamDone = true;
     // If playback already finished before this event arrived, fire now.
     if (!playing && playQueue.length === 0) {
@@ -453,6 +455,7 @@
 
   // Caller interruption — stop queued assistant playback immediately
   socket.on('speech-started', () => {
+    if (ending) return;
     stopPlayback();
     orbState('listening');
     setStatus('Listening...', 'connected');
@@ -462,10 +465,9 @@
   // FIX: 'lead-saved' — show green notification
   socket.on('lead-saved', (d) => {
     leadNotif.style.display = 'block';
-    leadNotif.innerHTML =
-      `✅ Lead saved — <strong>${d.caller_name ?? 'Unknown'}</strong>` +
-      ` | ${d.event_type ?? ''}` +
-      ` | Synced to ActiveCampaign`;
+    leadNotif.textContent =
+      `✅ ${d.capture_status === 'partial' ? 'Partial call record saved' : 'Lead saved'} — ${d.caller_name ?? 'Contact details incomplete'}` +
+      ` | ${d.event_type ?? 'unknown'} | ID: ${d.lead_id}`;
   });
 
   // FIX: 'transfer-initiated' — show yellow notification
@@ -481,6 +483,7 @@
 
   socket.on('realtime-error', (d) => {
     setStatus('Error: ' + (d.error?.message ?? 'Unknown'));
+    if (ending) endBtn.disabled = false;
   });
 
   socket.on('session-closed', () => endSession());
@@ -489,6 +492,9 @@
   startBtn.onclick = async () => {
     try {
       startBtn.disabled = true;
+      ending = false;
+      leadNotif.style.display = 'none';
+      transferNotif.style.display = 'none';
       setStatus('Connecting...');
       await startMic();
       isActive = true;
@@ -503,11 +509,18 @@
   };
 
   endBtn.onclick = () => {
+    ending = true;
+    isActive = false;
+    endBtn.disabled = true;
+    stopPlayback();
+    stopMic();
+    setStatus('Saving call details...');
     socket.emit('end-session');
-    endSession();
   };
 
   function endSession() {
+    ending = false;
+    endBtn.disabled = false;
     isActive = false;
     stopPlayback();
     stopMic();
@@ -516,7 +529,6 @@
     endBtn.classList.add('hidden');
     orbState(null);
     setStatus('Call ended');
-    leadNotif.style.display     = 'none';
     transferNotif.style.display = 'none';
   }
 </script>

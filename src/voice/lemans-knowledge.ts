@@ -394,15 +394,17 @@ Always confirm:
 4. Preferred event date or timeframe
 5. Headcount / group size
 6. Details of what they want to book or discuss
-Then delegate the lead capture to the application immediately and reassure the caller:
-"Awesome, I've got that all logged! Someone from the team will give you a quick call back to help get everything sorted. Is there anything else I can help you with today?"
+Delegate lead capture to the application as details arrive and again after any corrections.
+Only say details have been logged after the application confirms a successful save.
+If details are missing, ask one clear question at a time. Never require the caller to use a specific phrase to give their name.
 `;
 
 export const SAVE_LEAD_TOOL = {
   type: 'function' as const,
   name: 'save_lead',
+  strict: true,
   description:
-    'Saves caller enquiry details to the database and CRM. ' +
+    'Creates or updates the current call record in the database, including partial enquiries. ' +
     'Use when: (1) caller wants a callback, quote, or booking assistance, ' +
     '(2) caller wants to book an event, party, or racing session, ' +
     '(3) existing booking changes or complaints needing staff follow-up, ' +
@@ -410,10 +412,11 @@ export const SAVE_LEAD_TOOL = {
     'Corporate leads with group_size > 40 are assigned to Skye. All other leads are assigned to LeMans Inquiries.',
   parameters: {
     type: 'object',
+    additionalProperties: false,
     properties: {
-      caller_name: { type: 'string', description: "Caller's full or first name" },
-      caller_number: { type: 'string', description: "Caller's contact phone number" },
-      caller_email: { type: 'string', description: "Caller's email address if provided" },
+      caller_name: { type: ['string', 'null'], description: "Caller's full or first name, including a short answer to the assistant's question; null if unknown" },
+      caller_number: { type: ['string', 'null'], description: "Caller's callback phone number normalized from spoken digits; null if unknown" },
+      caller_email: { type: ['string', 'null'], description: "Caller's email address if provided; null if unknown" },
       event_type: {
         type: 'string',
         enum: [
@@ -435,19 +438,19 @@ export const SAVE_LEAD_TOOL = {
         ],
         description: 'The category or intent tag of enquiry matching CRM transfer rules',
       },
-      event_date: { type: 'string', description: 'Preferred event date, timeframe, or existing booking date' },
-      group_size: { type: 'number', description: 'Approximate group size or headcount if mentioned' },
+      event_date: { type: ['string', 'null'], description: 'Latest preferred event date or timeframe; null if unknown' },
+      group_size: { type: ['integer', 'null'], minimum: 1, description: 'Latest group size or headcount; null if unknown' },
       enquiry_details: {
-        type: 'string',
+        type: ['string', 'null'],
         description:
           'Detailed summary of customer enquiry, activities discussed, company name if corporate, and any customer notes',
       },
       preferred_language: {
-        type: 'string',
-        enum: ['english', 'mandarin'],
+        type: ['string', 'null'],
+        enum: ['english', 'mandarin', null] as (string | null)[],
         description: "Caller's preferred language",
       },
     },
-    required: ['caller_name', 'event_type', 'enquiry_details'],
+    required: ['caller_name', 'caller_number', 'caller_email', 'event_type', 'event_date', 'group_size', 'enquiry_details', 'preferred_language'],
   },
 };

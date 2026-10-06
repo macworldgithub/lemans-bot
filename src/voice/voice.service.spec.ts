@@ -4,6 +4,7 @@ import { getModelToken } from '@nestjs/mongoose';
 import { VoiceService } from './voice.service';
 import { Lead } from './schemas/lead.schema';
 import { ActiveCampaignService } from '../integrations/active-campaign.service';
+import { LeadCaptureService } from './lead-capture.service';
 
 describe('VoiceService', () => {
   let service: VoiceService;
@@ -12,6 +13,7 @@ describe('VoiceService', () => {
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         VoiceService,
+        { provide: LeadCaptureService, useValue: {} },
         {
           provide: ConfigService,
           useValue: {
