@@ -72,7 +72,7 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
   private readonly ariHttpClient: AxiosInstance;
   private readonly sessions = new Map<string, AriCallSession>();
   private readonly aiSessions = new Map<string, AiSession>();
-  // Ten seconds of 8 kHz PCMU: bounded startup buffering, never silent truncation.
+  private reconnectTimer: NodeJS.Timeout | null = null;
   private readonly maxStartupAudioBytes = 80_000;
 
   constructor(
@@ -119,8 +119,17 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
 
   async onModuleDestroy() {
     this.stopping = true;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
     if (this.eventSocket) {
-      this.eventSocket.close();
+      try {
+        this.eventSocket.removeAllListeners();
+        this.eventSocket.close();
+      } catch {
+        // ignore
+      }
       this.eventSocket = null;
     }
 
@@ -145,15 +154,44 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
   }
 
   private connectEventSocket() {
+    if (this.stopping) return;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+
+    if (this.eventSocket) {
+      try {
+        this.eventSocket.removeAllListeners();
+        this.eventSocket.terminate();
+      } catch {
+        // ignore
+      }
+      this.eventSocket = null;
+    }
+
     const wsUrl = this.getEventSocketUrl();
 
     this.logger.log(
       `Connecting ARI event socket: ${wsUrl.replace(/api_key=[^&]+/, 'api_key=***')}`,
     );
-    this.eventSocket = new WebSocket(wsUrl);
+
+    try {
+      this.eventSocket = new WebSocket(wsUrl);
+    } catch (err) {
+      this.logger.error(
+        `Failed to instantiate ARI event socket: ${(err as Error).message}`,
+      );
+      this.scheduleReconnect();
+      return;
+    }
 
     this.eventSocket.on('open', () => {
       this.connected = true;
+      if (this.reconnectTimer) {
+        clearTimeout(this.reconnectTimer);
+        this.reconnectTimer = null;
+      }
       this.logger.log('ARI event socket connected');
     });
 
@@ -183,15 +221,30 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
       }
     });
 
-    this.eventSocket.on('close', () => {
+    this.eventSocket.on('close', (code, reason) => {
       this.connected = false;
-      this.logger.warn('ARI event socket disconnected');
+      this.logger.warn(
+        `ARI event socket disconnected (code=${code}, reason=${reason?.toString() || 'none'})`,
+      );
+      this.scheduleReconnect();
     });
 
     this.eventSocket.on('error', (error) => {
       this.connected = false;
       this.logger.error(`ARI event socket error: ${error.message}`);
+      this.scheduleReconnect();
     });
+  }
+
+  private scheduleReconnect(delayMs = 3000) {
+    if (this.stopping || this.reconnectTimer) return;
+    this.logger.log(`Scheduling ARI reconnect in ${delayMs}ms...`);
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      if (!this.stopping) {
+        this.connectEventSocket();
+      }
+    }, delayMs);
   }
 
   private async handleStasisStart(event: AriEvent) {
