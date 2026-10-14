@@ -33,8 +33,8 @@ export class AriWebSocketGateway implements OnModuleInit, OnModuleDestroy {
 
   // Audio processing handlers
   private audioProcessor:
-    | ((callId: string, audioBuffer: Buffer) => Promise<Buffer | null>)
-    | null = null;
+    ((callId: string, audioBuffer: Buffer) => Promise<Buffer | null>) | null =
+    null;
 
   constructor(private readonly configService: ConfigService) {}
 
@@ -83,8 +83,9 @@ export class AriWebSocketGateway implements OnModuleInit, OnModuleDestroy {
     this.wsToCallId.set(client, callId);
     this.callIdToWs.set(callId, client);
 
-    client.on('message', (data: Buffer) => {
-      this.handleAudioMessage(callId, data);
+    client.on('message', (data: Buffer, isBinary: boolean) => {
+      // Asterisk media controls are text frames, never PCM samples.
+      if (isBinary) void this.handleAudioMessage(callId, data);
     });
 
     client.on('error', (error) => {
@@ -131,6 +132,12 @@ export class AriWebSocketGateway implements OnModuleInit, OnModuleDestroy {
       );
       return false;
     }
+  }
+
+  /** chan_websocket discards buffered media when a caller interrupts. */
+  flushCallAudio(callId: string): void {
+    const ws = this.callIdToWs.get(callId);
+    if (ws?.readyState === WebSocket.OPEN) ws.send('FLUSH_MEDIA');
   }
 
   /**

@@ -20,6 +20,7 @@ interface PrewarmState {
 }
 
 @WebSocketGateway({
+  transports: ['websocket'],
   cors: {
     origin: '*',
   },
@@ -56,7 +57,9 @@ export class VoiceGateway
     this.clearPrewarmState(client.id);
     this.clearSilenceTimer(client.id);
     void this.voiceService.closeSession(client.id).catch(() => {
-      this.logger.error(`Final lead save failed after disconnect: ${client.id}`);
+      this.logger.error(
+        `Final lead save failed after disconnect: ${client.id}`,
+      );
     });
   }
 
@@ -98,7 +101,9 @@ export class VoiceGateway
       client.emit('session-started', { sessionId });
       this.voiceService.triggerGreeting(sessionId);
     } catch (err) {
-      this.logger.error(`[VoiceGateway] Failed to start session: ${err.message}`);
+      this.logger.error(
+        `[VoiceGateway] Failed to start session: ${err.message}`,
+      );
       client.emit('realtime-error', {
         error: { message: 'Failed to connect to AI service' },
       });
@@ -124,7 +129,9 @@ export class VoiceGateway
       if (!hadSession) client.emit('session-closed', {});
     } catch {
       client.emit('realtime-error', {
-        error: { message: 'Could not save call details. Please retry End Call.' },
+        error: {
+          message: 'Could not save call details. Please retry End Call.',
+        },
       });
     }
   }
@@ -215,7 +222,7 @@ export class VoiceGateway
           break;
 
         case 'audio-done':
-          // Forward to client so it knows GPT-Live audio output has gone quiet
+          // The provider finished this reply; the browser still drains playback.
           client.emit('audio-done', {});
           break;
 
@@ -239,6 +246,12 @@ export class VoiceGateway
           // User spoke — cancel silence timer immediately
           this.clearSilenceTimer(client.id);
           client.emit('user-transcript', { transcript: event.transcript });
+          break;
+
+        case 'voice-latency':
+        case 'provider-reconnecting':
+        case 'provider-reconnected':
+          client.emit(event.type, event);
           break;
 
         case 'speech-started':

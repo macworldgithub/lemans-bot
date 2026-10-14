@@ -1,4 +1,4 @@
-import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
+import { Injectable, Logger, OnModuleDestroy, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { ClientRequest } from 'http';
 import { Socket as NetSocket } from 'net';
@@ -6,6 +6,7 @@ import { TLSSocket } from 'tls';
 import WebSocket from 'ws';
 import { LeadCaptureService } from './lead-capture.service';
 import { LEMANS_SYSTEM_PROMPT } from './lemans-knowledge';
+import { SandwichService } from './sandwich.service';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -46,25 +47,55 @@ export class VoiceService implements OnModuleDestroy {
   private readonly logger = new Logger(VoiceService.name);
   private sessions = new Map<string, RealtimeSession>();
   private readonly MAX_SILENCE_REPROMPTS = 2;
+  private readonly sandwichCalls = new Map<
+    string,
+    {
+      onEvent: (event: any) => void;
+      callerNumber: string;
+      active: boolean;
+      silenceCount: number;
+      closing?: Promise<void>;
+      closeTimer?: ReturnType<typeof setTimeout>;
+    }
+  >();
 
   constructor(
     private readonly config: ConfigService,
     private readonly leadCapture: LeadCaptureService,
+    @Optional() private readonly sandwich?: SandwichService,
   ) {}
 
   async onModuleDestroy(): Promise<void> {
-    await Promise.allSettled(
-      [...this.sessions.keys()].map((key) => this.closeSession(key)),
-    );
+    await Promise.allSettled([
+      ...[...this.sessions.keys()].map((key) => this.closeSession(key)),
+      ...[...this.sandwichCalls.keys()].map((key) => this.closeSession(key)),
+    ]);
   }
 
   hasSession(sessionId: string): boolean {
-    return this.sessions.has(sessionId);
+    return this.sessions.has(sessionId) || this.sandwichCalls.has(sessionId);
   }
 
   // ─── Silence handling ────────────────────────────────────────────────────────
 
   handleSilenceTimeout(sessionId: string): void {
+    const sandwichCall = this.sandwichCalls.get(sessionId);
+    if (sandwichCall?.active && !sandwichCall.closing) {
+      sandwichCall.silenceCount++;
+      this.sandwich!.speak(
+        sessionId,
+        sandwichCall.silenceCount > 2
+          ? "Thanks for contacting Le Mans Entertainment. Feel free to call back when you're ready. Take care!"
+          : "Hey there, are you still with me? I'm happy to help with your enquiry.",
+      );
+      if (sandwichCall.silenceCount > 2) {
+        sandwichCall.closeTimer = setTimeout(() => {
+          void this.closeSession(sessionId).catch(() => {});
+        }, 8000);
+        sandwichCall.closeTimer.unref();
+      }
+      return;
+    }
     const session = this.sessions.get(sessionId);
     if (!session) return;
 
@@ -137,6 +168,38 @@ export class VoiceService implements OnModuleDestroy {
     onEvent: (event: any) => void,
     callerNumber = 'unknown',
   ): Promise<void> {
+    if (this.isSandwichEnabled()) {
+      if (this.sandwichCalls.has(sessionId)) {
+        if (this.sandwichCalls.get(sessionId)?.closing)
+          throw new Error('Call is closing');
+        return;
+      }
+      const call = { onEvent, callerNumber, active: false, silenceCount: 0 };
+      this.sandwichCalls.set(sessionId, call);
+      try {
+        await this.sandwich!.createSession(sessionId, {
+          inputEncoding: 'linear16',
+          inputRate: 24000,
+          outputFormat: 'pcm_24000',
+          instructions: this.getSystemPrompt(),
+          onEvent: (event) => {
+            if (event.type === 'pipeline-closed') {
+              void this.closeSession(sessionId, false).catch(() => {});
+              return;
+            }
+            if (event.type === 'speech-started') call.silenceCount = 0;
+            onEvent(event);
+          },
+          onTranscript: (role, text) =>
+            this.leadCapture.appendTranscript(sessionId, role, text),
+          captureLead: () => this.leadCapture.captureLead(sessionId),
+        });
+      } catch (error) {
+        this.sandwichCalls.delete(sessionId);
+        throw error;
+      }
+      return;
+    }
     const apiKey = this.config.get<string>('OPENAI_API_KEY');
     const model = 'gpt-live-1';
     const url = 'wss://api.openai.com/v1/live/sessions';
@@ -246,6 +309,11 @@ export class VoiceService implements OnModuleDestroy {
   // ─── Send audio ──────────────────────────────────────────────────────────────
 
   sendAudio(sessionId: string, base64Audio: string): void {
+    if (this.sandwichCalls.has(sessionId)) {
+      if (this.sandwichCalls.get(sessionId)?.active)
+        this.sandwich!.sendAudio(sessionId, base64Audio);
+      return;
+    }
     const session = this.sessions.get(sessionId);
     if (!session || session.closing || session.ws.readyState !== WebSocket.OPEN)
       return;
@@ -260,6 +328,27 @@ export class VoiceService implements OnModuleDestroy {
   // ─── Trigger greeting ────────────────────────────────────────────────────────
 
   triggerGreeting(sessionId: string): void {
+    const call = this.sandwichCalls.get(sessionId);
+    if (call) {
+      if (call.active || call.closing) return;
+      call.active = true;
+      this.leadCapture.startSession(sessionId, call.callerNumber, {
+        onSaved: (data) => call.onEvent({ type: 'lead-saved', data }),
+        onError: () =>
+          call.onEvent({
+            type: 'realtime-error',
+            error: {
+              message:
+                'Could not save call details. Please retry ending the call.',
+            },
+          }),
+      });
+      this.sandwich!.speak(
+        sessionId,
+        "Hi, you've reached Le Mans Entertainment! I'm Chloe. How can I help you today?",
+      );
+      return;
+    }
     const session = this.sessions.get(sessionId);
     if (!session || session.closing || session.ws.readyState !== WebSocket.OPEN)
       return;
@@ -438,6 +527,41 @@ export class VoiceService implements OnModuleDestroy {
     this.leadCapture.startSession('phone:' + callId, callerNumber, { callId });
   }
 
+  public isSandwichEnabled(): boolean {
+    return (
+      !!this.sandwich &&
+      this.config.get<string>('VOICE_ARCHITECTURE') !== 'gpt-live'
+    );
+  }
+
+  public createPhonePipeline(
+    callId: string,
+    onEvent: (event: any) => void,
+  ): Promise<void> {
+    return this.sandwich!.createSession('phone:' + callId, {
+      inputEncoding: 'mulaw',
+      inputRate: 8000,
+      outputFormat: 'ulaw_8000',
+      instructions: this.getSystemPrompt(),
+      onEvent,
+      onTranscript: (role, text) =>
+        this.appendExternalTranscript(callId, role, text),
+      captureLead: () => this.leadCapture.captureLead('phone:' + callId),
+    });
+  }
+
+  public sendPhoneAudio(callId: string, audio: Buffer): void {
+    this.sandwich!.sendAudio('phone:' + callId, audio.toString('base64'));
+  }
+
+  public speakPhone(callId: string, text: string): void {
+    this.sandwich!.speak('phone:' + callId, text);
+  }
+
+  public closePhonePipeline(callId: string): Promise<void> {
+    return this.sandwich!.closeSession('phone:' + callId);
+  }
+
   public appendExternalTranscript(
     callId: string,
     role: 'user' | 'assistant',
@@ -480,6 +604,24 @@ export class VoiceService implements OnModuleDestroy {
 
   // Keep the session until final persistence completes; duplicate close events share one promise.
   closeSession(sessionId: string, drainTranscripts = true): Promise<void> {
+    const call = this.sandwichCalls.get(sessionId);
+    if (call) {
+      if (call.closing) return call.closing;
+      if (call.closeTimer) clearTimeout(call.closeTimer);
+      call.closing = (async () => {
+        await this.sandwich!.closeSession(
+          sessionId,
+          drainTranscripts && call.active,
+        );
+        if (call.active) await this.leadCapture.finalizeSession(sessionId);
+        this.sandwichCalls.delete(sessionId);
+        call.onEvent({ type: 'session-closed' });
+      })().catch((error) => {
+        call.closing = undefined;
+        throw error;
+      });
+      return call.closing;
+    }
     const session = this.sessions.get(sessionId);
     if (!session) return Promise.resolve();
     if (session.closing) return session.closing;

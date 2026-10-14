@@ -153,7 +153,7 @@ describe('AriService phone startup', () => {
     }
   });
 
-  it('waits for media binding before greeting and preserves caller audio until session.started', async () => {
+  it('seeds the legacy greeting at startup and preserves caller audio until session and media are ready', async () => {
     const bridge = blockBridge();
     const startup = api.handleStasisStart({ channel: { id: 'phone' } });
     await settle();
@@ -170,17 +170,19 @@ describe('AriService phone startup', () => {
       );
       expect(events.map((event) => event.type)).toEqual([
         'session.start',
-        'session.instructions.append',
         'session.input_audio.append',
       ]);
-      expect(events[2].audio).toBe(Buffer.from([1, 2, 3]).toString('base64'));
+      expect(
+        JSON.parse(ws.send.mock.calls[0][0]).session.input[0].content[0].text,
+      ).toContain('greet the caller');
+      expect(events[1].audio).toBe(Buffer.from([1, 2, 3]).toString('base64'));
       expect(rtp.setRemoteEndpoint).toHaveBeenCalledWith(
         'phone',
         '127.0.0.1',
         18000,
       );
       ws.emit('message', Buffer.from('{"type":"session.started"}'));
-      expect(ws.send).toHaveBeenCalledTimes(3);
+      expect(ws.send).toHaveBeenCalledTimes(2);
     } finally {
       bridge.resolve({ data: {} });
       await startup;
@@ -322,7 +324,7 @@ describe('AriService phone startup', () => {
     api.handleInboundRtpFrame('phone', Buffer.from([1, 2, 3]));
     expect(ws.send).toHaveBeenCalledTimes(1);
     ws.emit('message', Buffer.from('{"type":"session.started"}'));
-    expect(ws.send).toHaveBeenCalledTimes(3);
+    expect(ws.send).toHaveBeenCalledTimes(2);
   });
 
   it('cleans up a GPT session that never becomes ready', async () => {

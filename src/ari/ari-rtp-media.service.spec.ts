@@ -2,6 +2,7 @@ import { ConfigService } from '@nestjs/config';
 import { type RemoteInfo, type Socket } from 'node:dgram';
 import { AriRtpMediaService } from './ari-rtp-media.service';
 import { CallLatency } from './call-latency';
+import { performance } from 'node:perf_hooks';
 
 type RtpHarness = {
   handleIncomingPacket(
@@ -36,6 +37,7 @@ describe('AriRtpMediaService phone readiness', () => {
   afterEach(() => {
     service.onModuleDestroy();
     jest.useRealTimers();
+    jest.restoreAllMocks();
   });
 
   it('maps concurrent calls by their reported endpoints and replays early packets in order', () => {
@@ -70,6 +72,8 @@ describe('AriRtpMediaService phone readiness', () => {
 
   it('sends the first RTP packet only on the 20 ms tick and releases timers on hangup', () => {
     jest.useFakeTimers();
+    let now = 0;
+    jest.spyOn(performance, 'now').mockImplementation(() => now);
     const send = jest.fn(
       (
         _data: Buffer,
@@ -83,8 +87,10 @@ describe('AriRtpMediaService phone readiness', () => {
     service.setRemoteEndpoint('phone', '127.0.0.1', 18000);
     CallLatency.start('phone');
     service.sendUlawToCall('phone', Buffer.alloc(320));
+    now = 19;
     jest.advanceTimersByTime(19);
     expect(send).not.toHaveBeenCalled();
+    now = 20;
     jest.advanceTimersByTime(1);
     expect(send).toHaveBeenCalledTimes(1);
     service.unregisterCallSession('phone');

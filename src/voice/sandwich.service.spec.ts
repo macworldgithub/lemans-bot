@@ -1,0 +1,393 @@
+import { EventEmitter } from 'node:events';
+import { performance } from 'node:perf_hooks';
+import { ConfigService } from '@nestjs/config';
+import WebSocket from 'ws';
+import OpenAI from 'openai';
+import { SandwichOptions, SandwichService } from './sandwich.service';
+
+jest.mock('ws', () => {
+  const { EventEmitter } =
+    jest.requireActual<typeof import('node:events')>('node:events');
+  class Socket extends EventEmitter {
+    static OPEN = 1;
+    static CONNECTING = 0;
+    static instances: Socket[] = [];
+    readyState = 0;
+    bufferedAmount = 0;
+    send = jest.fn();
+    close = jest.fn(() => {
+      this.readyState = 3;
+      this.emit('close');
+    });
+    terminate = this.close;
+    constructor(
+      public url: URL,
+      public options: any,
+    ) {
+      super();
+      Socket.instances.push(this);
+    }
+  }
+  return { __esModule: true, default: Socket };
+});
+jest.mock('openai', () => ({ __esModule: true, default: jest.fn() }));
+type Socket = EventEmitter & {
+  url: URL;
+  options: any;
+  readyState: number;
+  send: jest.Mock;
+  close: jest.Mock;
+};
+const sockets = WebSocket as unknown as { instances: Socket[] };
+const message = (ws: Socket, event: object) =>
+  ws.emit('message', Buffer.from(JSON.stringify(event)));
+async function settle() {
+  for (let i = 0; i < 20; i++) await Promise.resolve();
+}
+
+describe('Sandwich streaming pipeline', () => {
+  let service: SandwichService;
+  let create: jest.Mock;
+  let options: SandwichOptions;
+  let stt: Socket;
+  let tts: Socket;
+  beforeEach(() => {
+    jest.useFakeTimers();
+    sockets.instances = [];
+    create = jest.fn().mockImplementation(async () =>
+      (async function* () {
+        yield { type: 'response.output_text.delta', delta: 'Hello there. ' };
+        yield { type: 'response.completed' };
+      })(),
+    );
+    (OpenAI as unknown as jest.Mock).mockImplementation(() => ({
+      responses: { create },
+    }));
+    const values = {
+      OPENAI_API_KEY: 'test',
+      ELEVENLABS_API_KEY: 'test',
+      ELEVENLABS_VOICE_ID: 'voice',
+      DeepGram_API_Key: 'legacy-key',
+    };
+    service = new SandwichService({
+      get: (key: string) => values[key],
+    } as unknown as ConfigService);
+    options = {
+      inputEncoding: 'linear16',
+      inputRate: 24000,
+      outputFormat: 'pcm_24000',
+      instructions: 'Chloe',
+      onEvent: jest.fn(),
+      onTranscript: jest.fn(),
+      captureLead: jest.fn().mockResolvedValue({ capture_status: 'complete' }),
+    };
+  });
+  afterEach(async () => {
+    await service.closeSession('call', false);
+    jest.useRealTimers();
+  });
+  async function connect(custom = options) {
+    const pending = service.createSession('call', custom);
+    [stt, tts] = sockets.instances;
+    stt.readyState = tts.readyState = 1;
+    stt.emit('open');
+    tts.emit('open');
+    message(stt, { type: 'Connected' });
+    await pending;
+  }
+  function turn(text = 'Can I book a party?', index = 0) {
+    message(stt, {
+      type: 'TurnInfo',
+      event: 'EndOfTurn',
+      transcript: text,
+      turn_index: index,
+      words: [{ end: 0.02 }],
+    });
+  }
+  function context(): string {
+    return tts.send.mock.calls
+      .map(([data]) => JSON.parse(data))
+      .find((event) => event.text === ' ').context_id;
+  }
+  it('requires Flux readiness and uses matching web and phone codecs with header auth', async () => {
+    await connect({
+      ...options,
+      inputEncoding: 'mulaw',
+      inputRate: 8000,
+      outputFormat: 'ulaw_8000',
+    });
+    expect(stt.url.pathname).toBe('/v2/listen');
+    expect(stt.url.searchParams.get('encoding')).toBe('mulaw');
+    expect(stt.url.searchParams.get('sample_rate')).toBe('8000');
+    expect(stt.options.headers.Authorization).toBe('Token legacy-key');
+    expect(tts.url.searchParams.get('output_format')).toBe('ulaw_8000');
+    expect(tts.url.searchParams.get('model_id')).toBe('eleven_flash_v2_5');
+    expect(tts.url.toString()).not.toContain('test');
+  });
+  it('batches streaming audio into 80ms and keeps Flux alive with silence audio', async () => {
+    let now = 0;
+    const clock = jest.spyOn(performance, 'now').mockImplementation(() => now);
+    await connect();
+    for (let i = 0; i < 4; i++)
+      service.sendAudio('call', Buffer.alloc(960).toString('base64'));
+    expect(stt.send).toHaveBeenCalledWith(Buffer.alloc(3840));
+    const count = stt.send.mock.calls.length;
+    now = 240;
+    await jest.advanceTimersByTimeAsync(240);
+    expect(stt.send.mock.calls.length).toBeGreaterThan(count);
+    clock.mockRestore();
+  });
+  it('streams LLM clauses to TTS before response completion and emits completion from TTS', async () => {
+    let finish!: () => void;
+    create.mockImplementation(async () =>
+      (async function* () {
+        yield { type: 'response.output_text.delta', delta: 'Hi there. ' };
+        await new Promise<void>((resolve) => {
+          finish = resolve;
+        });
+        yield { type: 'response.completed' };
+      })(),
+    );
+    await connect();
+    turn();
+    await settle();
+    expect(
+      tts.send.mock.calls.map(([data]) => JSON.parse(data)),
+    ).toContainEqual(
+      expect.objectContaining({ text: 'Hi there. ', flush: true }),
+    );
+    const id = context();
+    message(tts, { context_id: id, audio: 'AAA=' });
+    expect(options.onEvent).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'audio-delta' }),
+    );
+    expect(options.onEvent).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'audio-done' }),
+    );
+    finish();
+    await settle();
+    message(tts, { context_id: id, is_final: true });
+    expect(options.onEvent).toHaveBeenCalledWith({
+      type: 'audio-done',
+      turnId: id,
+    });
+  });
+  it('aborts generation on StartOfTurn, rejects old audio, and reuses both sockets', async () => {
+    await connect();
+    turn();
+    await settle();
+    const id = context();
+    const signal = create.mock.calls[0][1].signal as AbortSignal;
+    message(stt, { type: 'TurnInfo', event: 'StartOfTurn', turn_index: 1 });
+    expect(signal.aborted).toBe(true);
+    expect(tts.send).toHaveBeenCalledWith(
+      JSON.stringify({ context_id: id, close_context: true }),
+    );
+    const count = (options.onEvent as jest.Mock).mock.calls.length;
+    message(tts, { context_id: id, audio: 'AAA=', is_final: true });
+    expect((options.onEvent as jest.Mock).mock.calls.length).toBe(count);
+    turn('Actually, karting please.', 1);
+    await settle();
+    expect(create).toHaveBeenCalledTimes(2);
+    expect(sockets.instances).toHaveLength(2);
+  });
+  it('handles transcript revisions and duplicate final turns without duplicate LLM or lead writes', async () => {
+    await connect();
+    message(stt, {
+      type: 'TurnInfo',
+      event: 'Update',
+      transcript: 'My name is Sara',
+    });
+    message(stt, {
+      type: 'TurnInfo',
+      event: 'Update',
+      transcript: 'My name is Sarah',
+    });
+    turn('My name is Sarah');
+    turn('My name is Sarah');
+    await settle();
+    expect(options.onTranscript).toHaveBeenCalledWith(
+      'user',
+      'My name is Sarah ',
+    );
+    expect(create).toHaveBeenCalledTimes(1);
+    expect(options.onEvent).toHaveBeenCalledWith({
+      type: 'user-transcript',
+      transcript: 'My name is Sarah',
+    });
+  });
+  it('runs existing lead capture through a streamed tool round before confirming saving', async () => {
+    create.mockImplementationOnce(async () =>
+      (async function* () {
+        yield {
+          type: 'response.output_item.done',
+          item: {
+            type: 'function_call',
+            name: 'capture_lead',
+            call_id: 'lead1',
+            arguments: '{}',
+          },
+        };
+        yield { type: 'response.completed' };
+      })(),
+    );
+    await connect();
+    turn();
+    await settle();
+    expect(options.captureLead).toHaveBeenCalledTimes(1);
+    expect(create).toHaveBeenCalledTimes(2);
+    expect(create.mock.calls[1][0].input).toContainEqual(
+      expect.objectContaining({
+        type: 'function_call_output',
+        call_id: 'lead1',
+      }),
+    );
+  });
+  it('reports speech-end and detected-turn latency separately', async () => {
+    await connect();
+    service.sendAudio('call', Buffer.alloc(3840).toString('base64'));
+    turn();
+    await settle();
+    message(tts, { context_id: context(), audio: 'AAA=' });
+    const metric = (options.onEvent as jest.Mock).mock.calls
+      .map(([event]) => event)
+      .find((event) => event.type === 'voice-latency');
+    expect(metric.speechEndToFirstAudioMs).toBeGreaterThanOrEqual(
+      metric.endOfTurnToFirstAudioMs,
+    );
+    expect(metric.endpoint).toBe('server_audio_received');
+  });
+
+  it.each([
+    ['live camelCase', 'contextId', 'isFinal'],
+    ['reference snake_case', 'context_id', 'is_final'],
+  ])(
+    'forwards real speech audio and completes %s provider frames',
+    async (_label, contextKey, finalKey) => {
+      await connect();
+      turn();
+      await settle();
+      const id = context();
+      const audio = Buffer.alloc(960, 1).toString('base64');
+      message(tts, {
+        audio,
+        [contextKey]: id,
+        [finalKey]: null,
+        normalizedAlignment: null,
+        alignment: null,
+      });
+      expect(options.onEvent).toHaveBeenCalledWith({
+        type: 'audio-delta',
+        delta: audio,
+        turnId: id,
+      });
+      expect(options.onEvent).not.toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'audio-done' }),
+      );
+      message(tts, { audio: null, [contextKey]: id, [finalKey]: true });
+      expect(options.onEvent).toHaveBeenCalledWith({
+        type: 'audio-done',
+        turnId: id,
+      });
+      expect(
+        (options.onEvent as jest.Mock).mock.calls.filter(
+          ([event]) => event.type === 'voice-latency',
+        ),
+      ).toHaveLength(1);
+      // A repeated final frame must not complete a later turn or emit completion twice.
+      message(tts, { [contextKey]: id, [finalKey]: true });
+      expect(
+        (options.onEvent as jest.Mock).mock.calls.filter(
+          ([event]) => event.type === 'audio-done',
+        ),
+      ).toHaveLength(1);
+    },
+  );
+
+  it('still rejects interrupted camelCase audio while forwarding the next context', async () => {
+    await connect();
+    turn();
+    await settle();
+    const oldId = context();
+    message(stt, { type: 'TurnInfo', event: 'StartOfTurn', turn_index: 1 });
+    turn('Actually, tell me about karting.', 1);
+    await settle();
+    const newId = tts.send.mock.calls
+      .map(([data]) => JSON.parse(data))
+      .filter((event) => event.text === ' ')
+      .at(-1).context_id;
+    message(tts, { contextId: oldId, audio: 'AAA=', isFinal: true });
+    expect(options.onEvent).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'audio-delta', turnId: oldId }),
+    );
+    message(tts, { contextId: newId, audio: 'AAA=', isFinal: null });
+    expect(options.onEvent).toHaveBeenCalledWith({
+      type: 'audio-delta',
+      delta: 'AAA=',
+      turnId: newId,
+    });
+  });
+  it('reconnects STT with bounded backoff, retains queued input, and does not reconnect after close', async () => {
+    await connect();
+    stt.close();
+    service.sendAudio('call', Buffer.alloc(960).toString('base64'));
+    await jest.advanceTimersByTimeAsync(400);
+    const replacement = sockets.instances[2];
+    expect(replacement).toBeDefined();
+    replacement.readyState = 1;
+    message(replacement, { type: 'Connected' });
+    await settle();
+    expect(options.onEvent).toHaveBeenCalledWith({
+      type: 'provider-reconnected',
+      provider: 'stt',
+    });
+    await service.closeSession('call', false);
+    await jest.advanceTimersByTimeAsync(10000);
+    expect(sockets.instances).toHaveLength(3);
+  });
+  it('preserves final transcripts during close without generating another reply', async () => {
+    await connect();
+    const close = service.closeSession('call');
+    turn('One last detail');
+    await jest.advanceTimersByTimeAsync(750);
+    await close;
+    expect(options.onTranscript).toHaveBeenCalledWith(
+      'user',
+      'One last detail ',
+    );
+    expect(create).not.toHaveBeenCalled();
+    expect(service.hasSession('call')).toBe(false);
+  });
+
+  it('preserves an unfinished caller turn on hangup when Flux only supplied a partial transcript', async () => {
+    await connect();
+    message(stt, {
+      type: 'TurnInfo',
+      event: 'Update',
+      transcript: 'One unfinished detail',
+    });
+    const close = service.closeSession('call');
+    await jest.advanceTimersByTimeAsync(750);
+    await close;
+    expect(options.onTranscript).toHaveBeenCalledWith(
+      'user',
+      'One unfinished detail ',
+    );
+    expect(create).not.toHaveBeenCalled();
+  });
+  it('rejects unbounded input and closes the pipeline without leaking reconnect timers', async () => {
+    await connect();
+    stt.close();
+    for (let i = 0; i < 27; i++)
+      service.sendAudio('call', Buffer.alloc(3840).toString('base64'));
+    await settle();
+    expect(options.onEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'realtime-error',
+        error: expect.objectContaining({ recoverable: false }),
+      }),
+    );
+    await jest.advanceTimersByTimeAsync(10000);
+    expect(sockets.instances).toHaveLength(2);
+  });
+});

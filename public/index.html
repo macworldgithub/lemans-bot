@@ -230,7 +230,7 @@
 
 <script src="/socket.io/socket.io.js"></script>
 <script>
-  const socket = io();
+  const socket = io({ transports: ['websocket'] });
 
   const orb           = document.getElementById('orb');
   const badge         = document.getElementById('badge');
@@ -347,6 +347,7 @@
   // ─── Microphone capture via AudioWorklet ─────────────────────────────────────
   async function startMic() {
     audioCtx = new AudioContext({ sampleRate: CAPTURE_SR });
+    await audioCtx.resume();
 
     const code = `
       class PCMProcessor extends AudioWorkletProcessor {
@@ -399,7 +400,9 @@
       socket.emit('audio-chunk', { audio: btoa(bin) });
     };
     micSrc.connect(workletNode);
-    // Do not connect workletNode to destination to prevent mic feedback loop
+    // Keep the processor in the rendering graph. It writes no output samples,
+    // so this connection is silent and cannot play microphone feedback.
+    workletNode.connect(audioCtx.destination);
   }
 
   function stopMic() {
@@ -419,10 +422,10 @@
     panels.style.display = 'flex';
   });
 
-  // Each audio chunk from GPT-Live via the server
+  // Streaming PCM from the shared voice pipeline.
   socket.on('audio-delta', (d) => { if (!ending) enqueueAudio(d.delta); });
 
-  // The server infers stream completion from a short quiet interval. Wait until
+  // The server signals provider stream completion. Wait until
   // both that signal and the local playback queue have finished.
   socket.on('audio-done', () => {
     if (ending) return;
@@ -437,11 +440,12 @@
     }
   });
 
-  // Streaming transcript from GPT-Live speech output
+  // Streaming transcript from the voice agent.
   let agentText = '';
   socket.on('transcript-delta', (d) => {
     agentText += d.delta;
-    agentPanel.innerHTML = `<span class="active">${agentText}</span>`;
+    agentPanel.textContent = agentText;
+    agentPanel.classList.add('active');
   });
   socket.on('transcript-done', () => {
     agentText = '';
@@ -452,7 +456,11 @@
   socket.on('user-transcript-reset', () => { callerText = ''; });
   socket.on('user-transcript-delta', (d) => {
     callerText += d.delta;
-    userPanel.innerHTML = `<span class="active">${callerText}</span>`;
+    userPanel.textContent = callerText;
+  });
+  socket.on('user-transcript', (d) => {
+    callerText = d.transcript;
+    userPanel.textContent = callerText;
   });
 
   // Caller interruption — stop queued assistant playback immediately
@@ -486,6 +494,19 @@
   socket.on('realtime-error', (d) => {
     setStatus('Error: ' + (d.error?.message ?? 'Unknown'));
     if (ending) endBtn.disabled = false;
+  });
+
+  socket.on('provider-reconnecting', () => {
+    stopPlayback();
+    setStatus('Reconnecting voice service...');
+  });
+  socket.on('provider-reconnected', () => {
+    if (isActive) setStatus('Listening...', 'connected');
+  });
+  socket.on('disconnect', () => {
+    if (!isActive) return;
+    endSession();
+    setStatus('Connection lost. Reconnect and start a new call.');
   });
 
   socket.on('session-closed', () => endSession());

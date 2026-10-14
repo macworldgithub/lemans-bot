@@ -39,6 +39,12 @@ type AriCallSession = {
   createdAt: string;
   ended: boolean;
   mediaReady: boolean;
+  sandwichReady?: boolean;
+  sandwichGreeting?: boolean;
+  sandwichStartup?: Promise<void>;
+  sandwichWebSocket?: boolean;
+  sandwichPendingInput?: Buffer[];
+  sandwichPendingBytes?: number;
   startup?: Promise<void>;
   cleanup?: Promise<void>;
   hangupInbound: boolean;
@@ -434,8 +440,16 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
     session.hangupTimer = null;
     session.turns.close();
     this.cleanupAiSession(callId);
+    if (session.sandwichWebSocket)
+      this.ariWebSocketGateway.closeCallConnection(callId);
     this.ariRtpMediaService.unregisterCallSession(callId);
-    const leadFinalization = this.voiceService.finalizeExternalSession(callId).catch(() => {
+    const leadFinalization = (async () => {
+      if (session.sandwichStartup) {
+        await this.voiceService.closePhonePipeline(callId);
+        await session.sandwichStartup.catch(() => {});
+      }
+      await this.voiceService.finalizeExternalSession(callId);
+    })().catch(() => {
       this.logger.error(`[${callId}] Final lead persistence failed`);
     });
     session.cleanup = (async () => {
@@ -466,6 +480,12 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
     receivedAtMs?: number,
   ) {
     const call = this.sessions.get(callId);
+    if (call?.sandwichStartup) {
+      if (call.ended) return;
+      call.turns.input(ulawPayload, receivedAtMs);
+      this.forwardSandwichPhoneInput(callId, call, ulawPayload);
+      return;
+    }
     const ai = this.aiSessions.get(callId);
     if (!call || call.ended || !ai || ai.closed || ai.processingAudio) return;
     CallLatency.mark(callId, 'T12', 'First caller RTP audio received');
@@ -506,6 +526,22 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
 
   private activatePhoneAudio(callId: string) {
     const call = this.sessions.get(callId);
+    if (call?.sandwichStartup) {
+      if (call.ended || !call.mediaReady || !call.sandwichReady) return;
+      for (const audio of call.sandwichPendingInput ?? []) {
+        this.voiceService.sendPhoneAudio(callId, audio);
+      }
+      call.sandwichPendingInput = [];
+      call.sandwichPendingBytes = 0;
+      if (!call.sandwichGreeting) {
+        call.sandwichGreeting = true;
+        this.voiceService.speakPhone(
+          callId,
+          "Hi, you've reached Le Mans Entertainment! I'm Chloe. How can I help you today?",
+        );
+      }
+      return;
+    }
     const ai = this.aiSessions.get(callId);
     if (
       !call ||
@@ -557,6 +593,18 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
     callId: string,
     audioBuffer: Buffer,
   ): Promise<Buffer | null> {
+    const call = this.sessions.get(callId);
+    if (call?.sandwichStartup) {
+      if (!call.ended) {
+        call.sandwichWebSocket = true;
+        this.forwardSandwichPhoneInput(
+          callId,
+          call,
+          this.convertSlinToUlaw(audioBuffer),
+        );
+      }
+      return null;
+    }
     CallLatency.mark(callId, 'T12', 'First caller WebSocket audio received');
     const aiSession = this.aiSessions.get(callId);
     if (!aiSession || aiSession.closed) {
@@ -624,11 +672,11 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
     // Add bias
     sample += BIAS;
 
-    // Convert to u-law
-    let ulaw = sign | ((sample >> 2) & 0x0f);
-    ulaw |= ((sample >> 6) & 0x0f) << 4;
-
-    return ~ulaw & 0xff;
+    let exponent = 7;
+    for (let mask = 0x4000; exponent > 0 && !(sample & mask); mask >>= 1)
+      exponent--;
+    const mantissa = (sample >> (exponent + 3)) & 0x0f;
+    return ~(sign | (exponent << 4) | mantissa) & 0xff;
   }
 
   /**
@@ -660,9 +708,7 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
     const mantissa = ulaw & 0x0f;
 
     // Reconstruct the sample
-    let sample = (mantissa << 4) | 0x08;
-    sample <<= exponent;
-    sample -= BIAS;
+    let sample = (((mantissa << 3) + BIAS) << exponent) - BIAS;
 
     if (sign !== 0) {
       sample = -sample;
@@ -672,6 +718,61 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
   }
 
   private startAiSession(callId: string, instructions: string) {
+    if (this.voiceService.isSandwichEnabled?.()) {
+      const call = this.sessions.get(callId);
+      if (!call || call.sandwichStartup) return;
+      this.voiceService.startExternalSession(callId, call.callerNumber);
+      CallLatency.mark(callId, 'T8', 'Sandwich provider connections start');
+      call.sandwichStartup = this.voiceService
+        .createPhonePipeline(callId, (event) => {
+          if (call.ended) return;
+          if (event.type === 'speech-started') {
+            this.ariRtpMediaService.flushQueue(callId);
+            if (call.sandwichWebSocket)
+              this.ariWebSocketGateway.flushCallAudio(callId);
+            if (call.farewellTimer) clearTimeout(call.farewellTimer);
+            if (call.hangupTimer) clearTimeout(call.hangupTimer);
+            call.hangupAfterFarewell = false;
+            call.hangupPromptSent = false;
+            call.farewellAssistantAudioSeen = false;
+            call.callerTranscript = '';
+          } else if (event.type === 'user-transcript') {
+            call.callerTranscript = event.transcript;
+          } else if (event.type === 'voice-latency') {
+            CallLatency.event(callId, 'SANDWICH_TURN_LATENCY', event);
+          } else if (event.type === 'audio-delta') {
+            CallLatency.mark(callId, 'T14', 'First ElevenLabs audio received');
+            const audio = Buffer.from(event.delta, 'base64');
+            if (call.sandwichWebSocket) {
+              this.ariWebSocketGateway.sendAudioToCall(
+                callId,
+                this.convertUlawToSlin(audio),
+              );
+            } else this.ariRtpMediaService.sendUlawToCall(callId, audio);
+          } else if (event.type === 'audio-done') {
+            this.scheduleFarewellHangup(callId, call);
+            if (this.callerClearlyEndedCall(call.callerTranscript ?? '')) {
+              call.farewellAssistantAudioSeen = true;
+            }
+          } else if (
+            event.type === 'pipeline-closed' ||
+            (event.type === 'realtime-error' &&
+              event.error?.recoverable === false)
+          ) {
+            this.failPhoneCall(callId, 'SANDWICH_CONNECTION_FAILED');
+          }
+        })
+        .then(() => {
+          if (call.ended) return;
+          call.sandwichReady = true;
+          CallLatency.mark(callId, 'T11', 'Sandwich pipeline ready');
+          this.activatePhoneAudio(callId);
+        });
+      void call.sandwichStartup.catch(() =>
+        this.failPhoneCall(callId, 'SANDWICH_STARTUP_FAILED'),
+      );
+      return;
+    }
     if (this.aiSessions.has(callId)) return;
     const apiKey = this.configService.get<string>('OPENAI_API_KEY');
     if (!apiKey) throw new Error('OPENAI_API_KEY missing');
@@ -776,7 +877,11 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
     const call = this.sessions.get(callId);
     if (!ai || ai.closed || !call || call.ended) return;
     try {
-      const event = JSON.parse(rawEvent) as { type?: string; delta?: string; delegation?: { id?: string; name?: string } };
+      const event = JSON.parse(rawEvent) as {
+        type?: string;
+        delta?: string;
+        delegation?: { id?: string; name?: string };
+      };
       switch (event.type) {
         case 'session.started':
           if (ai.ready) return;
@@ -789,12 +894,21 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
           break;
         case 'session.input_transcript.delta':
           this.handleBargeIn(callId);
-          call.callerTranscript = (call.callerTranscript || '') + (event.delta ?? '');
-          this.voiceService.appendExternalTranscript(callId, 'user', event.delta ?? '');
+          call.callerTranscript =
+            (call.callerTranscript || '') + (event.delta ?? '');
+          this.voiceService.appendExternalTranscript(
+            callId,
+            'user',
+            event.delta ?? '',
+          );
           this.scheduleFarewellHangup(callId, call);
           break;
         case 'session.output_transcript.delta':
-          this.voiceService.appendExternalTranscript(callId, 'assistant', event.delta ?? '');
+          this.voiceService.appendExternalTranscript(
+            callId,
+            'assistant',
+            event.delta ?? '',
+          );
           break;
         case 'session.delegation.created': {
           const delegationId = event.delegation?.id;
@@ -806,25 +920,31 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
               delegationId,
               sendCommentary: (content) => {
                 if (ai.ws.readyState === WebSocket.OPEN) {
-                  ai.ws.send(JSON.stringify({
-                    type: 'session.commentary.append',
-                    delegation_id: delegationId,
-                    content,
-                  }));
+                  ai.ws.send(
+                    JSON.stringify({
+                      type: 'session.commentary.append',
+                      delegation_id: delegationId,
+                      content,
+                    }),
+                  );
                 }
               },
               sendThinking: (content) => {
                 if (ai.ws.readyState === WebSocket.OPEN) {
-                  ai.ws.send(JSON.stringify({
-                    type: 'session.thinking.append',
-                    delegation_id: delegationId,
-                    content,
-                  }));
+                  ai.ws.send(
+                    JSON.stringify({
+                      type: 'session.thinking.append',
+                      delegation_id: delegationId,
+                      content,
+                    }),
+                  );
                 }
               },
             });
           } else {
-            this.logger.warn(`[${callId}] Tool call failed name=client_delegation reason=missing_delegation_id`);
+            this.logger.warn(
+              `[${callId}] Tool call failed name=client_delegation reason=missing_delegation_id`,
+            );
           }
           break;
         }
@@ -900,6 +1020,29 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
     this.ariRtpMediaService.flushQueue(callId);
   }
 
+  private forwardSandwichPhoneInput(
+    callId: string,
+    call: AriCallSession,
+    audio: Buffer,
+  ): void {
+    if (call.ended) return;
+    if (!call.sandwichReady || !call.mediaReady) {
+      if (
+        (call.sandwichPendingBytes ?? 0) + audio.length >
+        16_000 // At most two seconds of 8kHz caller audio during Sandwich startup.
+      ) {
+        this.failPhoneCall(callId, 'INPUT_BUFFER_LIMIT');
+        return;
+      }
+      (call.sandwichPendingInput ??= []).push(Buffer.from(audio));
+      call.sandwichPendingBytes =
+        (call.sandwichPendingBytes ?? 0) + audio.length;
+      return;
+    }
+    this.voiceService.sendPhoneAudio(callId, audio);
+    CallLatency.mark(callId, 'T13', 'First caller audio forwarded to Flux');
+  }
+
   private scheduleFarewellHangup(callId: string, call: AriCallSession) {
     if (call.farewellTimer) clearTimeout(call.farewellTimer);
     call.farewellTimer = null;
@@ -927,6 +1070,12 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
         if (!call.hangupPromptSent) {
           const ai = this.aiSessions.get(callId);
           call.hangupPromptSent = true;
+          if (call.sandwichStartup) {
+            this.voiceService.speakPhone(
+              callId,
+              'Thanks for calling Le Mans Entertainment. Have a lovely day!',
+            );
+          }
           if (ai && !ai.closed && ai.ws.readyState === WebSocket.OPEN) {
             try {
               ai.ws.send(
