@@ -46,6 +46,11 @@ type AriCallSession = {
   callerNumber?: string;
   callerTranscript?: string;
   savedLead?: boolean;
+  farewellTimer?: ReturnType<typeof setTimeout> | null;
+  hangupTimer?: ReturnType<typeof setTimeout> | null;
+  hangupAfterFarewell?: boolean;
+  hangupPromptSent?: boolean;
+  farewellAssistantAudioSeen?: boolean;
 };
 
 type AiSession = {
@@ -54,7 +59,6 @@ type AiSession = {
   closed: boolean;
   processingAudio: boolean;
   ready: boolean;
-  greetingSent: boolean;
   pendingInput: Buffer[];
   pendingInputBytes: number;
   pendingOutput: Buffer[];
@@ -424,6 +428,10 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
     if (session.cleanup) return session.cleanup;
     // Cancel locally before waiting for any in-flight ARI request.
     session.ended = true;
+    if (session.farewellTimer) clearTimeout(session.farewellTimer);
+    if (session.hangupTimer) clearTimeout(session.hangupTimer);
+    session.farewellTimer = null;
+    session.hangupTimer = null;
     session.turns.close();
     this.cleanupAiSession(callId);
     this.ariRtpMediaService.unregisterCallSession(callId);
@@ -510,18 +518,6 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
     )
       return;
     try {
-      if (!ai.greetingSent) {
-        ai.greetingSent = true;
-        ai.ws.send(
-          JSON.stringify({
-            type: 'session.instructions.append',
-            delegation_id: null,
-            content:
-              'Greet the caller now in English as Chloe from LeMans Entertainment. Welcome them warmly, introduce yourself, ask how you can help, then pause and listen.',
-          }),
-        );
-        CallLatency.mark(callId, 'GREETING', 'Greeting instruction sent');
-      }
       // Preserve ordered startup speech; no input is sent before session.started.
       for (const audio of ai.pendingInput) {
         if (call.ended) break;
@@ -536,7 +532,7 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
       ai.pendingOutput = [];
       ai.pendingOutputBytes = 0;
     } catch {
-      this.failPhoneCall(callId, 'GREETING_SEND_FAILED');
+      this.failPhoneCall(callId, 'PHONE_AUDIO_ACTIVATION_FAILED');
     }
   }
 
@@ -690,7 +686,6 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
       closed: false,
       processingAudio: false,
       ready: false,
-      greetingSent: false,
       pendingInput: [],
       pendingInputBytes: 0,
       pendingOutput: [],
@@ -718,6 +713,18 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
             session: {
               model: 'gpt-live-1',
               instructions,
+              input: [
+                {
+                  type: 'message',
+                  role: 'developer',
+                  content: [
+                    {
+                      type: 'input_text',
+                      text: 'As soon as the phone call is connected, greet the caller in English as Chloe from LeMans Entertainment. Welcome them warmly, introduce yourself, and ask how you can help. Start speaking immediately; do not wait for the caller to say hello or for a silence timeout. Then pause and listen. Keep your delivery warm, clear, and conversational.',
+                    },
+                  ],
+                },
+              ],
               audio: {
                 format: { type: 'audio/pcmu', rate: 8000 },
                 output: {
@@ -729,6 +736,11 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
               delegation: { type: 'client' },
             },
           }),
+        );
+        CallLatency.mark(
+          callId,
+          'GREETING',
+          'Opening greeting seeded at session startup',
         );
         CallLatency.mark(callId, 'T10', 'AI session configuration sent');
         CallLatency.event(callId, 'VAD_CONFIG', {
@@ -779,6 +791,7 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
           this.handleBargeIn(callId);
           call.callerTranscript = (call.callerTranscript || '') + (event.delta ?? '');
           this.voiceService.appendExternalTranscript(callId, 'user', event.delta ?? '');
+          this.scheduleFarewellHangup(callId, call);
           break;
         case 'session.output_transcript.delta':
           this.voiceService.appendExternalTranscript(callId, 'assistant', event.delta ?? '');
@@ -817,6 +830,12 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
         }
         case 'session.output_audio.delta': {
           if (!event.delta) return;
+          if (call.farewellTimer || call.hangupAfterFarewell) {
+            call.farewellAssistantAudioSeen = true;
+          }
+          if (call.hangupAfterFarewell) {
+            this.scheduleHangupAfterFarewellAudio(callId, call);
+          }
           CallLatency.mark(callId, 'T14', 'First AI audio delta received');
           call.turns.output();
           const audio = Buffer.from(event.delta, 'base64');
@@ -881,6 +900,95 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
     this.ariRtpMediaService.flushQueue(callId);
   }
 
+  private scheduleFarewellHangup(callId: string, call: AriCallSession) {
+    if (call.farewellTimer) clearTimeout(call.farewellTimer);
+    call.farewellTimer = null;
+    if (!this.callerClearlyEndedCall(call.callerTranscript ?? '')) {
+      call.farewellAssistantAudioSeen = false;
+      return;
+    }
+
+    // Transcript deltas arrive in pieces. Wait for a short pause so a caller
+    // who says "bye, one more thing" is not disconnected mid-sentence.
+    call.farewellTimer = setTimeout(() => {
+      call.farewellTimer = null;
+      if (
+        call.ended ||
+        !this.callerClearlyEndedCall(call.callerTranscript ?? '')
+      )
+        return;
+
+      call.hangupAfterFarewell = true;
+      if (call.farewellAssistantAudioSeen) {
+        this.scheduleHangupAfterFarewellAudio(callId, call);
+        return;
+      }
+      call.hangupTimer = setTimeout(() => {
+        if (!call.hangupPromptSent) {
+          const ai = this.aiSessions.get(callId);
+          call.hangupPromptSent = true;
+          if (ai && !ai.closed && ai.ws.readyState === WebSocket.OPEN) {
+            try {
+              ai.ws.send(
+                JSON.stringify({
+                  type: 'session.instructions.append',
+                  delegation_id: null,
+                  content:
+                    'The caller has clearly ended the conversation. Say one brief, polite goodbye now, then stop speaking. Do not ask another question.',
+                }),
+              );
+            } catch {
+              // The final hangup fallback below still ends the call cleanly.
+            }
+          }
+          call.hangupTimer = setTimeout(
+            () => void this.finishPhoneCall(callId),
+            6_000,
+          );
+          call.hangupTimer.unref();
+          return;
+        }
+        void this.finishPhoneCall(callId);
+      }, 3_500);
+      call.hangupTimer.unref();
+    }, 900);
+    call.farewellTimer.unref();
+  }
+
+  private scheduleHangupAfterFarewellAudio(
+    callId: string,
+    call: AriCallSession,
+  ) {
+    if (call.hangupTimer) clearTimeout(call.hangupTimer);
+    call.hangupTimer = setTimeout(() => {
+      if (call.ended) return;
+      if (!this.ariRtpMediaService.isOutputQueueDrained(callId)) {
+        call.hangupTimer = setTimeout(
+          () => this.scheduleHangupAfterFarewellAudio(callId, call),
+          100,
+        );
+        call.hangupTimer.unref();
+        return;
+      }
+      void this.finishPhoneCall(callId);
+    }, 1_500);
+    call.hangupTimer.unref();
+  }
+
+  private callerClearlyEndedCall(transcript: string): boolean {
+    const normalized = transcript.trim().replace(/\s+/g, ' ');
+    return /(?:\b(?:bye(?:\s+bye)?|goodbye|good\s+bye|see\s+you(?:\s+later)?|see\s+ya|talk\s+to\s+you\s+later|that(?:'s|\s+is)\s+(?:all|it)|please\s+hang\s+up|hang\s+up(?:\s+now)?|you\s+can\s+hang\s+up|i\s+(?:need|have)\s+to\s+hang\s+up|we\s+(?:need|should)\s+to\s+hang\s+up|end\s+the\s+call\s+now|let's\s+end\s+the\s+call|i(?:'m|\s+am)\s+done)\b[.!?,\s]*)$/i.test(
+      normalized,
+    );
+  }
+
+  private async finishPhoneCall(callId: string) {
+    const call = this.sessions.get(callId);
+    if (!call || call.ended) return;
+    this.logger.log(`[${callId}] Caller farewell detected; ending phone call`);
+    await this.cleanupSession(callId, true);
+  }
+
   private cleanupAiSession(callId: string) {
     const aiSession = this.aiSessions.get(callId);
     if (!aiSession) {
@@ -915,7 +1023,7 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
   }
 
   private getDefaultAiInstructions() {
-    return `${this.voiceService.getSystemPrompt()}\n\nGPT-Live telephony guidance: Speak warmly, concisely, and naturally in an Australian voice. Ask one clear question at a time, and stop to listen when interrupted. For callback, quote, booking assistance, party bookings, corporate events, complaints, or other staff follow-up requests, collect the caller’s name, phone number, and enquiry details, then delegate the task to the application to save the enquiry and sync with the CRM.`;
+    return `${this.voiceService.getSystemPrompt()}\n\nGPT-Live telephony guidance: Speak warmly, concisely, and naturally in an Australian voice. Ask one clear question at a time, and stop to listen when interrupted. When the caller clearly says goodbye or asks to end the call, respond with one brief, polite goodbye and do not ask another question. For callback, quote, booking assistance, party bookings, corporate events, complaints, or other staff follow-up requests, collect the caller’s name, phone number, and enquiry details, then delegate the task to the application to save the enquiry and sync with the CRM.`;
   }
 
   private async answerChannel(channelId: string) {

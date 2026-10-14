@@ -281,7 +281,7 @@ export class VoiceService implements OnModuleDestroy {
         type: 'session.instructions.append',
         delegation_id: null,
         content:
-          'Greet the caller now in English as Chloe from LeMans Entertainment. Welcome them warmly, introduce yourself, ask how you can help, then pause and listen.',
+          'The caller has just started the web voice session. Begin speaking immediately in English as Chloe from LeMans Entertainment; do not wait for the caller to say hello. Welcome them warmly, introduce yourself, ask how you can help, then pause and listen.',
       }),
     );
   }

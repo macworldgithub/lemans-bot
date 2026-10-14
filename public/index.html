@@ -262,6 +262,7 @@
   const CAPTURE_SR  = 24000;
   const PLAYBACK_SR = 24000;
   const PLAYBACK_LEAD_SECONDS = 0.06;
+  const PLAYBACK_SPEED = 1.05;
 
   // ─── Orb / badge helpers ─────────────────────────────────────────────────────
   function orbState(state) {
@@ -295,10 +296,11 @@
       buf.copyToChannel(samples, 0);
       const src = audioCtx.createBufferSource();
       src.buffer = buf;
+      src.playbackRate.value = PLAYBACK_SPEED;
       src.connect(audioCtx.destination);
       // Schedule on the audio clock so delayed main-thread callbacks don't add gaps.
       const startAt = Math.max(nextPlayTime, audioCtx.currentTime + PLAYBACK_LEAD_SECONDS);
-      nextPlayTime = startAt + buf.duration;
+      nextPlayTime = startAt + buf.duration / PLAYBACK_SPEED;
       scheduledAudio.add(src);
       src.onended = () => {
         scheduledAudio.delete(src);
