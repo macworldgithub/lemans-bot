@@ -351,6 +351,7 @@ export class VoiceService implements OnModuleDestroy {
       this.sandwich!.speak(
         sessionId,
         "Hi, you've reached Le Mans Entertainment! I'm Chloe. How can I help you today?",
+        true,
       );
       return;
     }
@@ -555,12 +556,16 @@ export class VoiceService implements OnModuleDestroy {
     });
   }
 
-  public sendPhoneAudio(callId: string, audio: Buffer): void {
-    this.sandwich!.sendAudio('phone:' + callId, audio.toString('base64'));
+  public sendPhoneAudio(callId: string, audio: Buffer, startup = false): void {
+    this.sandwich!.sendAudio(
+      'phone:' + callId,
+      audio.toString('base64'),
+      startup,
+    );
   }
 
-  public speakPhone(callId: string, text: string): void {
-    this.sandwich!.speak('phone:' + callId, text);
+  public speakPhone(callId: string, text: string, greeting = false): void {
+    this.sandwich!.speak('phone:' + callId, text, greeting);
   }
 
   public closePhonePipeline(callId: string): Promise<void> {

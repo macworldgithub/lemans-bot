@@ -14,7 +14,9 @@ jest.mock('ws', () => {
     static instances: Socket[] = [];
     readyState = 0;
     bufferedAmount = 0;
-    send = jest.fn();
+    send = jest.fn((_data: unknown, callback?: (error?: Error) => void) =>
+      callback?.(),
+    );
     close = jest.fn(() => {
       this.readyState = 3;
       this.emit('close');
@@ -35,6 +37,7 @@ type Socket = EventEmitter & {
   url: URL;
   options: any;
   readyState: number;
+  bufferedAmount: number;
   send: jest.Mock;
   close: jest.Mock;
 };
@@ -159,6 +162,277 @@ describe('Sandwich streaming pipeline', () => {
     await jest.advanceTimersByTimeAsync(240);
     expect(stt.send.mock.calls.length).toBeGreaterThan(count);
     clock.mockRestore();
+  });
+  it('preserves a 1.6 second phone startup burst while the STT socket drains', async () => {
+    await connect({
+      ...options,
+      inputEncoding: 'mulaw',
+      inputRate: 8000,
+      outputFormat: 'ulaw_8000',
+    });
+    stt.send.mockImplementation((data: unknown) => {
+      if (Buffer.isBuffer(data)) stt.bufferedAmount += data.length + 8;
+    });
+    const frames = Array.from({ length: 80 }, (_, index) =>
+      Buffer.alloc(160, index),
+    );
+    for (const frame of frames)
+      service.sendAudio('call', frame.toString('base64'));
+    expect(service.hasSession('call')).toBe(true);
+    expect(options.onEvent).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'realtime-error' }),
+    );
+    // The next heartbeat resumes the retained frames after the network catches up.
+    stt.bufferedAmount = 0;
+    await jest.advanceTimersByTimeAsync(80);
+    const sent = stt.send.mock.calls
+      .map(([data]) => data)
+      .filter(Buffer.isBuffer);
+    expect(Buffer.concat(sent)).toEqual(Buffer.concat(frames));
+    expect(sent.every((frame) => frame.length === 640)).toBe(true);
+    // After the startup backlog, the next caller question must still reach the
+    // model and produce speech instead of leaving a silent, dead connection.
+    turn('What activities do you have for children?');
+    await settle();
+    message(tts, { context_id: context(), audio: 'AAA=' });
+    expect(create).toHaveBeenCalledTimes(1);
+    expect(options.onEvent).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'audio-delta' }),
+    );
+  });
+
+  it('still closes a persistently blocked STT socket after the drain deadline', async () => {
+    const clock = jest.spyOn(performance, 'now').mockReturnValue(1000);
+    try {
+      await connect({
+        ...options,
+        inputEncoding: 'mulaw',
+        inputRate: 8000,
+        outputFormat: 'ulaw_8000',
+      });
+      stt.bufferedAmount = 9000;
+      service.sendAudio('call', Buffer.alloc(640).toString('base64'));
+      expect(service.hasSession('call')).toBe(true);
+      clock.mockReturnValue(6001);
+      await jest.advanceTimersByTimeAsync(80);
+      expect(options.onEvent).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'realtime-error',
+          error: expect.objectContaining({
+            recoverable: false,
+            code: 'STT_BACKPRESSURE',
+          }),
+        }),
+      );
+      expect(service.hasSession('call')).toBe(false);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+  it('keeps the retained STT input bounded when audio continues on a blocked network', async () => {
+    await connect({
+      ...options,
+      inputEncoding: 'mulaw',
+      inputRate: 8000,
+      outputFormat: 'ulaw_8000',
+    });
+    stt.bufferedAmount = 9000;
+    for (let i = 0; i < 101; i++)
+      service.sendAudio('call', Buffer.alloc(160).toString('base64'));
+    await settle();
+    expect(options.onEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'realtime-error',
+        error: expect.objectContaining({
+          code: 'INPUT_BUFFER_LIMIT',
+          recoverable: false,
+        }),
+      }),
+    );
+    expect(service.hasSession('call')).toBe(false);
+  });
+  it('drains a five-second phone startup backlog and then restores the live input bound', async () => {
+    await connect({
+      ...options,
+      inputEncoding: 'mulaw',
+      inputRate: 8000,
+      outputFormat: 'ulaw_8000',
+    });
+    stt.send.mockImplementation((data: unknown) => {
+      if (Buffer.isBuffer(data)) stt.bufferedAmount += data.length + 8;
+    });
+    stt.bufferedAmount = 9000;
+    const startup = Buffer.alloc(40960, 42);
+    service.sendAudio('call', startup.toString('base64'), true);
+    expect(service.hasSession('call')).toBe(true);
+    for (let i = 0; i < 6; i++) {
+      stt.bufferedAmount = 0;
+      await jest.advanceTimersByTimeAsync(80);
+    }
+    const sent = stt.send.mock.calls
+      .map(([data]) => data)
+      .filter(Buffer.isBuffer);
+    expect(Buffer.concat(sent)).toEqual(startup);
+    expect(service.hasSession('call')).toBe(true);
+    stt.bufferedAmount = 9000;
+    service.sendAudio('call', Buffer.alloc(16160).toString('base64'));
+    await settle();
+    expect(service.hasSession('call')).toBe(false);
+  });
+
+  it('finishes the greeting before answering delayed speech from startup audio', async () => {
+    await connect({
+      ...options,
+      inputEncoding: 'mulaw',
+      inputRate: 8000,
+      outputFormat: 'ulaw_8000',
+    });
+    service.sendAudio('call', Buffer.alloc(640).toString('base64'), true);
+    service.speak('call', 'Hi, I am Chloe. How can I help?', true);
+    const greeting = context();
+    message(tts, { contextId: greeting, audio: 'AAA=' });
+    message(stt, {
+      type: 'TurnInfo',
+      event: 'StartOfTurn',
+      turn_index: 0,
+      audio_window_end: 0.04,
+    });
+    message(stt, {
+      type: 'TurnInfo',
+      event: 'EndOfTurn',
+      turn_index: 0,
+      transcript: 'What activities do you have?',
+      words: [{ end: 0.06 }],
+    });
+    await settle();
+    expect(create).not.toHaveBeenCalled();
+    expect(options.onEvent).not.toHaveBeenCalledWith({
+      type: 'speech-started',
+    });
+    message(tts, { contextId: greeting, audio: 'AAA=', isFinal: true });
+    await settle();
+    expect(
+      (options.onEvent as jest.Mock).mock.calls.filter(
+        ([e]) => e.type === 'audio-delta' && e.turnId === greeting,
+      ),
+    ).toHaveLength(2);
+    expect(create).toHaveBeenCalledTimes(1);
+    expect(create.mock.calls[0][0].input).toEqual([
+      { role: 'assistant', content: 'Hi, I am Chloe. How can I help?' },
+      { role: 'user', content: 'What activities do you have?' },
+    ]);
+  });
+
+  it.each(['StartOfTurn', 'Update'])(
+    'allows new speech during the greeting to interrupt via %s',
+    async (event) => {
+      await connect({
+        ...options,
+        inputEncoding: 'mulaw',
+        inputRate: 8000,
+        outputFormat: 'ulaw_8000',
+      });
+      service.sendAudio('call', Buffer.alloc(640).toString('base64'), true);
+      service.speak('call', 'Hi, I am Chloe.', true);
+      const greeting = context();
+      if (event === 'Update')
+        message(stt, {
+          type: 'TurnInfo',
+          event: 'StartOfTurn',
+          audio_window_end: 0.04,
+        });
+      message(stt, {
+        type: 'TurnInfo',
+        event,
+        audio_window_end: 0.2,
+        transcript: 'Excuse me',
+      });
+      message(tts, { contextId: greeting, audio: 'AAA=' });
+      expect(options.onEvent).toHaveBeenCalledWith({ type: 'speech-started' });
+      expect(options.onEvent).not.toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'audio-delta', turnId: greeting }),
+      );
+    },
+  );
+
+  it('does not start an introduction over an already active caller turn', async () => {
+    await connect();
+    message(stt, { type: 'TurnInfo', event: 'StartOfTurn', turn_index: 0 });
+    service.speak('call', 'Hi, I am Chloe.', true);
+    expect(tts.send).not.toHaveBeenCalled();
+    turn('Can I book a party?');
+    await settle();
+    expect(create).toHaveBeenCalledTimes(1);
+  });
+
+  it('waits for final socket writes before the transcript grace period on hangup', async () => {
+    await connect({
+      ...options,
+      inputEncoding: 'mulaw',
+      inputRate: 8000,
+      outputFormat: 'ulaw_8000',
+    });
+    stt.bufferedAmount = 9000;
+    service.sendAudio('call', Buffer.alloc(640).toString('base64'));
+    stt.send.mockImplementation((_data: unknown, callback?: () => void) => {
+      if (callback) setTimeout(callback, 100);
+    });
+    const close = service.closeSession('call');
+    expect(service.closeSession('call')).toBe(close);
+    await jest.advanceTimersByTimeAsync(1000);
+    expect(service.hasSession('call')).toBe(true);
+    expect(stt.send).not.toHaveBeenCalledWith(
+      JSON.stringify({ type: 'CloseStream' }),
+      expect.anything(),
+    );
+    stt.bufferedAmount = 0;
+    await jest.advanceTimersByTimeAsync(250);
+    turn('Actually, use the corrected number.');
+    await jest.advanceTimersByTimeAsync(750);
+    await close;
+    expect(options.onTranscript).toHaveBeenCalledWith(
+      'user',
+      'Actually, use the corrected number. ',
+    );
+    expect(create).not.toHaveBeenCalled();
+    expect(service.hasSession('call')).toBe(false);
+    expect(jest.getTimerCount()).toBe(0);
+  });
+
+  it('bounds hangup when a socket write callback never completes', async () => {
+    await connect();
+    let written: (() => void) | undefined;
+    stt.send.mockImplementation((_data: unknown, callback?: () => void) => {
+      written = callback;
+    });
+    const close = service.closeSession('call');
+    await jest.advanceTimersByTimeAsync(6000);
+    await close;
+    const count = stt.send.mock.calls.length;
+    written?.();
+    expect(stt.send).toHaveBeenCalledTimes(count);
+    expect(service.hasSession('call')).toBe(false);
+    expect(jest.getTimerCount()).toBe(0);
+  });
+  it('releases a failed final write and preserves the last known partial transcript', async () => {
+    await connect();
+    message(stt, {
+      type: 'TurnInfo',
+      event: 'Update',
+      transcript: 'Please use the other email',
+    });
+    stt.send.mockImplementation(
+      (_data: unknown, callback?: (error?: Error) => void) =>
+        callback?.(new Error('write failed')),
+    );
+    await service.closeSession('call');
+    expect(service.hasSession('call')).toBe(false);
+    expect(options.onTranscript).toHaveBeenCalledWith(
+      'user',
+      'Please use the other email ',
+    );
+    expect(create).not.toHaveBeenCalled();
+    expect(jest.getTimerCount()).toBe(0);
   });
   it('streams LLM clauses to TTS before response completion and emits completion from TTS', async () => {
     let finish!: () => void;

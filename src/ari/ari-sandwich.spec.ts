@@ -87,6 +87,7 @@ describe('Asterisk Sandwich adapter', () => {
     expect(voice.sendPhoneAudio).toHaveBeenCalledWith(
       'phone',
       Buffer.alloc(160, 0xff),
+      true,
     );
     expect(voice.speakPhone).toHaveBeenCalledTimes(1);
     api.activatePhoneAudio('phone');
@@ -103,6 +104,52 @@ describe('Asterisk Sandwich adapter', () => {
     );
     event({ type: 'speech-started' });
     expect(rtp.flushQueue).toHaveBeenCalledWith('phone');
+  });
+  it('retains five seconds of audio while providers start and marks it as startup input', async () => {
+    await api.handleStasisStart({ channel: { id: 'phone' } });
+    for (let i = 0; i < 250; i++)
+      api.handleInboundRtpFrame('phone', Buffer.alloc(160, i % 256));
+    expect(rtp.unregisterCallSession).not.toHaveBeenCalled();
+    ready();
+    await settle();
+    expect(voice.sendPhoneAudio).toHaveBeenCalledTimes(250);
+    expect(
+      voice.sendPhoneAudio.mock.calls.every(
+        ([id, frame, startup]) =>
+          id === 'phone' && frame.length === 160 && startup === true,
+      ),
+    ).toBe(true);
+    expect(voice.speakPhone).toHaveBeenCalledWith(
+      'phone',
+      expect.any(String),
+      true,
+    );
+  });
+  it('keeps phone startup buffering bounded while providers remain unavailable', async () => {
+    await api.handleStasisStart({ channel: { id: 'phone' } });
+    for (let i = 0; i < 601; i++)
+      api.handleInboundRtpFrame('phone', Buffer.alloc(160));
+    expect(rtp.unregisterCallSession).toHaveBeenCalledWith('phone');
+    expect(voice.speakPhone).not.toHaveBeenCalled();
+    ready();
+    await settle();
+    expect(voice.sendPhoneAudio).not.toHaveBeenCalled();
+  });
+  it('does not start a greeting after buffered input causes the pipeline to fail', async () => {
+    await api.handleStasisStart({ channel: { id: 'phone' } });
+    api.handleInboundRtpFrame('phone', Buffer.alloc(160));
+    api.handleInboundRtpFrame('phone', Buffer.alloc(160));
+    voice.sendPhoneAudio.mockImplementation(() =>
+      event({
+        type: 'realtime-error',
+        error: { recoverable: false, code: 'STT_BACKPRESSURE' },
+      }),
+    );
+    ready();
+    await settle();
+    expect(voice.sendPhoneAudio).toHaveBeenCalledTimes(1);
+    expect(voice.speakPhone).not.toHaveBeenCalled();
+    expect(rtp.unregisterCallSession).toHaveBeenCalledWith('phone');
   });
   it('flushes the optional WebSocket media path and uses valid G.711 silence conversion', async () => {
     await api.handleStasisStart({ channel: { id: 'phone' } });

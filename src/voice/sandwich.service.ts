@@ -6,6 +6,9 @@ import OpenAI from 'openai';
 import type { ResponseInputItem } from 'openai/resources/responses/responses';
 import WebSocket from 'ws';
 
+// Match the provider startup deadline, while keeping normal live input small.
+export const PHONE_STARTUP_AUDIO_SECONDS = 12;
+
 export interface SandwichOptions {
   inputEncoding: 'linear16' | 'mulaw';
   inputRate: 8000 | 24000;
@@ -29,9 +32,17 @@ interface Reply {
   inputTurn?: number;
   complete: boolean;
   contextOpen: boolean;
+  greetingCutoff?: number;
   timer?: ReturnType<typeof setTimeout>;
   textTimer?: ReturnType<typeof setTimeout>;
 }
+
+type DeferredCallerTurn = {
+  text: string;
+  index: number;
+  speechEnd: number | null;
+  endedAt: number;
+};
 
 interface Session {
   options: SandwichOptions;
@@ -46,6 +57,10 @@ interface Session {
   input: Buffer;
   sentSeconds: number;
   lastSentAt: number;
+  sttBlockedAt?: number;
+  startupInputPending?: boolean;
+  callerSpeaking?: boolean;
+  deferredTurns?: DeferredCallerTurn[];
   lastTurn: number;
   transcript: string;
   transcriptCommitted: boolean;
@@ -126,7 +141,7 @@ export class SandwichService implements OnModuleDestroy {
     return session.ready;
   }
 
-  sendAudio(id: string, base64: string): void {
+  sendAudio(id: string, base64: string, startup = false): void {
     const session = this.sessions.get(id);
     if (!session || session.closed || session.draining) return;
     // Bound individual packets and queued input; never accumulate seconds of stale speech.
@@ -140,7 +155,11 @@ export class SandwichService implements OnModuleDestroy {
     const bytesPerSecond = this.bytesPerSecond(session);
     if (session.options.inputEncoding === 'linear16' && audio.length % 2)
       return;
-    if (session.input.length + audio.length > bytesPerSecond * 2) {
+    if (startup) session.startupInputPending = true;
+    const inputSeconds = session.startupInputPending
+      ? PHONE_STARTUP_AUDIO_SECONDS
+      : 2;
+    if (session.input.length + audio.length > bytesPerSecond * inputSeconds) {
       this.fatal(id, session, 'INPUT_BUFFER_LIMIT');
       return;
     }
@@ -152,11 +171,16 @@ export class SandwichService implements OnModuleDestroy {
     }
   }
 
-  speak(id: string, text: string): void {
+  speak(id: string, text: string, greeting = false): void {
     const session = this.sessions.get(id);
     if (!session || session.closed || session.draining) return;
+    if (greeting && session.callerSpeaking) return;
     const reply = this.beginReply(id, session);
     if (!reply) return;
+    if (greeting)
+      reply.greetingCutoff =
+        session.sentSeconds +
+        session.input.length / this.bytesPerSecond(session);
     try {
       this.emitText(session, reply, text);
       this.finishText(session, reply);
@@ -182,18 +206,7 @@ export class SandwichService implements OnModuleDestroy {
     session.closePromise = (async () => {
       try {
         if (drain && session.stt?.readyState === WebSocket.OPEN) {
-          if (session.input.length) {
-            this.sendStt(session, session.input);
-            session.input = Buffer.alloc(0);
-          }
-          session.stt.send(JSON.stringify({ type: 'CloseStream' }));
-          await new Promise<void>((resolve) => {
-            const timeout = setTimeout(resolve, 750);
-            session.stt!.once('close', () => {
-              clearTimeout(timeout);
-              resolve();
-            });
-          });
+          await this.drainStt(id, session);
         }
       } catch {
         /* Release both sockets even if the final input send fails. */
@@ -209,10 +222,10 @@ export class SandwichService implements OnModuleDestroy {
         if (!ws) continue;
         if (ws.readyState === WebSocket.CONNECTING) ws.terminate();
         else if (ws.readyState === WebSocket.OPEN) {
-          ws.close();
           const timer = setTimeout(() => ws.terminate(), 1000);
           timer.unref();
           ws.once('close', () => clearTimeout(timer));
+          ws.close();
         }
       }
       if (this.sessions.get(id) === session) this.sessions.delete(id);
@@ -233,6 +246,71 @@ export class SandwichService implements OnModuleDestroy {
     );
   }
 
+  private drainStt(id: string, session: Session): Promise<void> {
+    const ws = session.stt!;
+    return new Promise<void>((resolve) => {
+      let finished = false;
+      let poll: ReturnType<typeof setTimeout> | undefined;
+      let grace: ReturnType<typeof setTimeout> | undefined;
+      const finish = () => {
+        if (finished) return;
+        finished = true;
+        clearTimeout(deadline);
+        if (poll) clearTimeout(poll);
+        if (grace) clearTimeout(grace);
+        ws.removeListener('close', finish);
+        ws.removeListener('error', finish);
+        resolve();
+      };
+      const deadline = setTimeout(() => {
+        this.logger.warn(
+          JSON.stringify({
+            event: 'voice-stt-drain-timeout',
+            sessionId: id,
+            inputQueuedBytes: session.input.length,
+            socketBufferedBytes: ws.bufferedAmount,
+          }),
+        );
+        finish();
+      }, 6000);
+      ws.once('close', finish);
+      ws.once('error', finish);
+      const writeNext = () => {
+        if (finished) return;
+        if (ws.readyState !== WebSocket.OPEN) return finish();
+        try {
+          if (session.input.length) {
+            const size = Math.min(
+              session.input.length,
+              this.bytesPerSecond(session) * 0.08,
+            );
+            if (ws.bufferedAmount + size > this.bytesPerSecond(session)) {
+              poll = setTimeout(writeNext, 20);
+              return;
+            }
+            const audio = session.input.subarray(0, size);
+            session.input = session.input.subarray(size);
+            this.sendStt(session, audio, (error) => {
+              if (finished) return;
+              if (error) finish();
+              else writeNext();
+            });
+          } else {
+            // FIFO write completion covers earlier queued audio as well as CloseStream.
+            ws.send(JSON.stringify({ type: 'CloseStream' }), (error) => {
+              if (finished) return;
+              if (error) finish();
+              else grace = setTimeout(finish, 750);
+            });
+          }
+        } catch {
+          finish();
+        }
+      };
+      writeNext();
+    });
+  }
+
   private bytesPerSecond(session: Session): number {
     return (
       session.options.inputRate *
@@ -247,12 +325,10 @@ export class SandwichService implements OnModuleDestroy {
       session.stt?.readyState !== WebSocket.OPEN
     )
       return;
-    if (session.stt.bufferedAmount > this.bytesPerSecond(session)) {
-      this.fatal(id, session, 'STT_BACKPRESSURE');
-      return;
-    }
     const size = this.bytesPerSecond(session) * 0.08;
+    if (!this.hasSttCapacity(id, session, size)) return;
     while (session.input.length >= size) {
+      if (!this.hasSttCapacity(id, session, size)) return;
       this.sendStt(session, session.input.subarray(0, size));
       session.input = session.input.subarray(size);
     }
@@ -265,12 +341,47 @@ export class SandwichService implements OnModuleDestroy {
       session.input = Buffer.alloc(0);
       this.sendStt(session, padding);
     }
+    if (!session.input.length) session.startupInputPending = false;
   }
 
-  private sendStt(session: Session, audio: Buffer): void {
-    session.stt!.send(audio);
+  private hasSttCapacity(
+    id: string,
+    session: Session,
+    chunkBytes: number,
+  ): boolean {
+    const socketBytes = session.stt!.bufferedAmount;
+    if (socketBytes + chunkBytes <= this.bytesPerSecond(session)) {
+      session.sttBlockedAt = undefined;
+      return true;
+    }
+    // Startup audio can fill a writable socket temporarily. Keep it in order in
+    // the bounded input queue and let the 80 ms heartbeat retry after I/O drains.
+    const now = performance.now();
+    if (session.sttBlockedAt === undefined) {
+      session.sttBlockedAt = now;
+      this.logger.warn(
+        JSON.stringify({
+          event: 'voice-stt-backpressure',
+          sessionId: id,
+          socketBufferedBytes: socketBytes,
+          inputQueuedBytes: session.input.length,
+        }),
+      );
+    } else if (now - session.sttBlockedAt >= 5000) {
+      this.fatal(id, session, 'STT_BACKPRESSURE');
+    }
+    return false;
+  }
+
+  private sendStt(
+    session: Session,
+    audio: Buffer,
+    callback?: (error?: Error) => void,
+  ): void {
     session.sentSeconds += audio.length / this.bytesPerSecond(session);
     session.lastSentAt = performance.now();
+    if (callback) session.stt!.send(audio, callback);
+    else session.stt!.send(audio);
   }
 
   private connect(
@@ -298,6 +409,7 @@ export class SandwichService implements OnModuleDestroy {
       headers = { Authorization: `Token ${this.deepgramKey()}` };
       session.sentSeconds = 0;
       session.lastTurn = -1;
+      session.sttBlockedAt = undefined;
     } else {
       const voice = encodeURIComponent(
         this.config.get<string>('ELEVENLABS_VOICE_ID')!,
@@ -441,13 +553,37 @@ export class SandwichService implements OnModuleDestroy {
 
   private handleTurn(id: string, session: Session, event: any): void {
     if (event.type !== 'TurnInfo') return;
+    const position = event.words?.at(-1)?.end ?? event.audio_window_end;
+    const cutoff = session.reply?.greetingCutoff;
+    const beforeGreeting =
+      cutoff !== undefined &&
+      typeof position === 'number' &&
+      Number.isFinite(position) &&
+      position <= cutoff;
     if (event.event === 'StartOfTurn' || event.event === 'TurnResumed') {
       if (session.draining) return;
-      this.cancelReply(session);
+      session.callerSpeaking = true;
+      if (!beforeGreeting) {
+        this.cancelReply(session);
+        session.options.onEvent({ type: 'speech-started' });
+      }
       session.transcript = '';
       session.transcriptCommitted = false;
-      session.options.onEvent({ type: 'speech-started' });
       session.options.onEvent({ type: 'user-transcript-reset' });
+    }
+    // If that same caller turn continues into the greeting, it is a genuine
+    // interruption now, even though its StartOfTurn described earlier audio.
+    if (
+      event.event === 'Update' &&
+      session.callerSpeaking &&
+      cutoff !== undefined &&
+      !beforeGreeting &&
+      typeof position === 'number' &&
+      Number.isFinite(position) &&
+      !session.draining
+    ) {
+      this.cancelReply(session);
+      session.options.onEvent({ type: 'speech-started' });
     }
     if (
       typeof event.transcript === 'string' &&
@@ -467,10 +603,10 @@ export class SandwichService implements OnModuleDestroy {
     )
       return;
     session.lastTurn = event.turn_index;
+    session.callerSpeaking = false;
     session.transcriptCommitted = true;
     const text: string = event.transcript.trim();
     session.options.onTranscript('user', text + ' ');
-    session.history.push({ role: 'user', content: text });
     if (session.draining) return;
     const now = performance.now();
     const lastWord = event.words?.at(-1)?.end;
@@ -480,15 +616,44 @@ export class SandwichService implements OnModuleDestroy {
       typeof lastWord === 'number'
         ? session.lastSentAt - (session.sentSeconds - lastWord) * 1000
         : null;
-    const reply = this.beginReply(
-      id,
-      session,
-      speechEnd !== null && speechEnd <= now && now - speechEnd < 60_000
-        ? speechEnd
-        : null,
-    );
+    const turn = {
+      text,
+      index: event.turn_index,
+      speechEnd:
+        speechEnd !== null && speechEnd <= now && now - speechEnd < 60_000
+          ? speechEnd
+          : null,
+      endedAt: now,
+    };
+    if (beforeGreeting) {
+      // Finish the already-playing introduction, then answer all earlier caller
+      // turns. Do not flush the introduction in response to delayed STT events.
+      (session.deferredTurns ??= []).push(turn);
+      session.deferredTurns = session.deferredTurns.slice(-40);
+      return;
+    }
+    this.flushDeferredTurns(session);
+    session.history.push({ role: 'user', content: text });
+    this.replyToTurn(id, session, turn);
+  }
+
+  private flushDeferredTurns(session: Session): DeferredCallerTurn | undefined {
+    const turns = session.deferredTurns ?? [];
+    session.deferredTurns = [];
+    for (const turn of turns)
+      session.history.push({ role: 'user', content: turn.text });
+    return turns.at(-1);
+  }
+
+  private replyToTurn(
+    id: string,
+    session: Session,
+    turn: DeferredCallerTurn,
+  ): void {
+    const reply = this.beginReply(id, session, turn.speechEnd);
     if (!reply) return;
-    reply.inputTurn = event.turn_index;
+    reply.inputTurn = turn.index;
+    reply.endOfTurn = turn.endedAt;
     void this.generate(id, session, reply);
   }
 
@@ -824,10 +989,14 @@ export class SandwichService implements OnModuleDestroy {
       session.history.push({ role: 'assistant', content: reply.text });
       session.reply = undefined;
       session.options.onEvent({ type: 'audio-done', turnId: reply.id });
+      const deferred = this.flushDeferredTurns(session);
+      if (deferred && !session.closed && !session.draining)
+        this.replyToTurn(id, session, deferred);
     }
   }
 
   private cancelReply(session: Session): void {
+    this.flushDeferredTurns(session);
     const reply = session.reply;
     if (!reply) return;
     session.reply = undefined; // Invalidate before abort/close can dispatch late events.
@@ -856,6 +1025,7 @@ export class SandwichService implements OnModuleDestroy {
       error: {
         message: 'Voice connection failed. Please reconnect.',
         recoverable: false,
+        code,
       },
     });
     void this.closeSession(id, false).then(() =>

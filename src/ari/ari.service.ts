@@ -13,6 +13,7 @@ import { PhoneTurnLatency } from './phone-turn-latency';
 import { VoiceService } from '../voice/voice.service';
 import { AriRtpMediaService } from './ari-rtp-media.service';
 import { AriWebSocketGateway } from './ari-websocket.gateway';
+import { PHONE_STARTUP_AUDIO_SECONDS } from '../voice/sandwich.service';
 
 type AriEvent = {
   type?: string;
@@ -578,6 +579,7 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
     const call = this.sessions.get(callId);
     if (call?.sandwichStartup) {
       if (call.ended) return;
+      CallLatency.mark(callId, 'T12', 'First caller RTP audio received');
       call.turns.input(ulawPayload, receivedAtMs);
       this.forwardSandwichPhoneInput(callId, call, ulawPayload);
       return;
@@ -624,16 +626,26 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
     const call = this.sessions.get(callId);
     if (call?.sandwichStartup) {
       if (call.ended || !call.mediaReady || !call.sandwichReady) return;
-      for (const audio of call.sandwichPendingInput ?? []) {
-        this.voiceService.sendPhoneAudio(callId, audio);
-      }
+      const pending = call.sandwichPendingInput ?? [];
+      if (pending.length)
+        CallLatency.event(callId, 'SANDWICH_INPUT_RELEASE', {
+          bytes: call.sandwichPendingBytes ?? 0,
+          audioMs: Math.round((call.sandwichPendingBytes ?? 0) / 8),
+        });
       call.sandwichPendingInput = [];
       call.sandwichPendingBytes = 0;
+      for (const audio of pending) {
+        if (call.ended) return;
+        this.voiceService.sendPhoneAudio(callId, audio, true);
+        CallLatency.mark(callId, 'T13', 'First caller audio forwarded to Flux');
+      }
+      if (call.ended) return;
       if (!call.sandwichGreeting) {
         call.sandwichGreeting = true;
         this.voiceService.speakPhone(
           callId,
           "Hi, you've reached Le Mans Entertainment! I'm Chloe. How can I help you today?",
+          true,
         );
       }
       return;
@@ -855,7 +867,12 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
             (event.type === 'realtime-error' &&
               event.error?.recoverable === false)
           ) {
-            this.failPhoneCall(callId, 'SANDWICH_CONNECTION_FAILED');
+            this.failPhoneCall(
+              callId,
+              typeof event.error?.code === 'string'
+                ? event.error.code
+                : 'SANDWICH_CONNECTION_FAILED',
+            );
           }
         })
         .then(() => {
@@ -1142,7 +1159,7 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
     if (!call.sandwichReady || !call.mediaReady) {
       if (
         (call.sandwichPendingBytes ?? 0) + audio.length >
-        16_000 // At most two seconds of 8kHz caller audio during Sandwich startup.
+        8_000 * PHONE_STARTUP_AUDIO_SECONDS
       ) {
         this.failPhoneCall(callId, 'INPUT_BUFFER_LIMIT');
         return;
