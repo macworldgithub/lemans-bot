@@ -8,6 +8,7 @@ describe('VoiceService Sandwich lead lifecycle', () => {
     let callbacks: any;
     let saved!: () => void;
     const lead = {
+      hasPendingFinalization: jest.fn().mockReturnValue(false),
       startSession: jest.fn(),
       appendTranscript: jest.fn(),
       finalizeSession: jest.fn(

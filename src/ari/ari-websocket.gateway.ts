@@ -25,7 +25,9 @@ import { WebSocketServer } from 'ws';
 @Injectable()
 export class AriWebSocketGateway implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(AriWebSocketGateway.name);
-  private server: WebSocketServer;
+  private server?: WebSocketServer;
+  private stopping = false;
+  private shutdown?: Promise<void>;
 
   // Map WebSocket connections to call IDs
   private readonly wsToCallId = new Map<WebSocket, string>();
@@ -39,6 +41,7 @@ export class AriWebSocketGateway implements OnModuleInit, OnModuleDestroy {
   constructor(private readonly configService: ConfigService) {}
 
   onModuleInit() {
+    if (this.stopping) return;
     try {
       const port = this.configService.get<number>('WEBSOCKET_PORT', 9090);
       this.logger.log(`Attempting to start WebSocket server on port ${port}`);
@@ -60,14 +63,53 @@ export class AriWebSocketGateway implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  onModuleDestroy() {
+  onModuleDestroy(): Promise<void> {
+    if (this.shutdown) return this.shutdown;
+    this.stopping = true;
+    this.audioProcessor = null;
     this.logger.log('AriWebSocketGateway shutting down');
-    if (this.server) {
-      this.server.close();
+    const server = this.server;
+    if (!server) {
+      this.wsToCallId.clear();
+      this.callIdToWs.clear();
+      this.shutdown = Promise.resolve();
+      return this.shutdown;
     }
+
+    this.shutdown = new Promise<void>((resolve) => {
+      // close() stops new connections; existing clients need their own close.
+      const timeout = setTimeout(() => {
+        for (const client of server.clients) {
+          if (client.readyState !== WebSocket.CLOSED) client.terminate();
+        }
+      }, 1000);
+
+      server.close(() => {
+        clearTimeout(timeout);
+        this.wsToCallId.clear();
+        this.callIdToWs.clear();
+        this.server = undefined;
+        resolve();
+      });
+
+      // Use the server's list, which also includes rejected/unmapped clients.
+      for (const client of server.clients) {
+        if (client.readyState === WebSocket.OPEN) {
+          client.close(1001, 'Server shutting down');
+        } else if (client.readyState === WebSocket.CONNECTING) {
+          client.terminate();
+        }
+      }
+    });
+    return this.shutdown;
   }
 
   async handleConnection(client: WebSocket, request: any) {
+    // An upgrade already in progress can finish after shutdown has started.
+    if (this.stopping) {
+      client.terminate();
+      return;
+    }
     const url = request.url || '';
     const callId = this.extractCallIdFromUrl(url);
 
@@ -118,6 +160,7 @@ export class AriWebSocketGateway implements OnModuleInit, OnModuleDestroy {
    * Send audio data to the WebSocket (to Asterisk)
    */
   sendAudioToCall(callId: string, audioBuffer: Buffer): boolean {
+    if (this.stopping) return false;
     const ws = this.callIdToWs.get(callId);
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       return false;
@@ -136,6 +179,7 @@ export class AriWebSocketGateway implements OnModuleInit, OnModuleDestroy {
 
   /** chan_websocket discards buffered media when a caller interrupts. */
   flushCallAudio(callId: string): void {
+    if (this.stopping) return;
     const ws = this.callIdToWs.get(callId);
     if (ws?.readyState === WebSocket.OPEN) ws.send('FLUSH_MEDIA');
   }
@@ -154,6 +198,7 @@ export class AriWebSocketGateway implements OnModuleInit, OnModuleDestroy {
    * Handle incoming binary audio data from Asterisk
    */
   private async handleAudioMessage(callId: string, data: Buffer) {
+    if (this.stopping) return;
     if (!this.audioProcessor) {
       this.logger.warn(`No audio processor set for call=${callId}`);
       return;
@@ -228,7 +273,7 @@ export class AriWebSocketGateway implements OnModuleInit, OnModuleDestroy {
    */
   getHealth() {
     return {
-      listening: Boolean(this.server),
+      listening: Boolean(this.server) && !this.stopping,
       port: this.configService.get<number>('WEBSOCKET_PORT', 9090),
       activeConnections: this.wsToCallId.size,
       activeCalls: this.callIdToWs.size,

@@ -5,7 +5,7 @@ import { Socket as NetSocket } from 'net';
 import { TLSSocket } from 'tls';
 import WebSocket from 'ws';
 import { LeadCaptureService } from './lead-capture.service';
-import { LEMANS_SYSTEM_PROMPT } from './lemans-knowledge';
+import { getEventDateContext, LEMANS_SYSTEM_PROMPT } from './lemans-knowledge';
 import { SandwichService } from './sandwich.service';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -168,6 +168,11 @@ export class VoiceService implements OnModuleDestroy {
     onEvent: (event: any) => void,
     callerNumber = 'unknown',
   ): Promise<void> {
+    if (this.leadCapture.hasPendingFinalization(sessionId)) {
+      throw new Error(
+        'Previous call details are still being saved; please retry shortly.',
+      );
+    }
     if (this.isSandwichEnabled()) {
       if (this.sandwichCalls.has(sessionId)) {
         if (this.sandwichCalls.get(sessionId)?.closing)
@@ -512,7 +517,7 @@ export class VoiceService implements OnModuleDestroy {
       return 'The incident information collected so far has been saved. Direct the caller to the nearest staff member or Track Marshall immediately, or to Triple Zero (000) if anyone is in danger or needs urgent medical help. Do not delay urgent help to collect contact details.';
     }
     if (result.capture_status !== 'complete') {
-      return 'A partial call record was saved. Ask for any missing caller name, callback phone number, or enquiry details, one question at a time. Delegate again once the caller responds.';
+      return 'A partial call record was saved. Complete any pending phone/email read-back confirmation, otherwise ask only the next relevant missing detail in one short question. Do not recap other details or repeat a save acknowledgment. Delegate again when new or corrected details arrive.';
     }
     const destination =
       result.assignedTo === 'Skye'
@@ -520,7 +525,7 @@ export class VoiceService implements OnModuleDestroy {
         : result.event_type === 'complaint'
           ? 'the duty manager'
           : 'the team';
-    return `The caller details and enquiry were successfully saved in the database for ${destination} to follow up. Tell the caller their enquiry is logged. Ask whether they have any corrections or additional details.`;
+    return `The enquiry was saved for ${destination} to follow up. Complete any pending phone/email read-back confirmation, otherwise continue with only the next relevant unanswered workflow question in a short sentence. Do not repeat already-confirmed contact details, other details, or save acknowledgments. If the pathway is complete, confirm it is noted once and ask if they need anything else, unless already asked or the caller is saying goodbye.`;
   }
 
   public startExternalSession(callId: string, callerNumber?: string): void {
@@ -602,7 +607,7 @@ export class VoiceService implements OnModuleDestroy {
     }
   }
 
-  // Keep the session until final persistence completes; duplicate close events share one promise.
+  // Duplicate closes share one promise; lead capture owns persistence retries.
   closeSession(sessionId: string, drainTranscripts = true): Promise<void> {
     const call = this.sandwichCalls.get(sessionId);
     if (call) {
@@ -613,8 +618,13 @@ export class VoiceService implements OnModuleDestroy {
           sessionId,
           drainTranscripts && call.active,
         );
-        if (call.active) await this.leadCapture.finalizeSession(sessionId);
-        this.sandwichCalls.delete(sessionId);
+        try {
+          if (call.active) await this.leadCapture.finalizeSession(sessionId);
+        } finally {
+          // The transport is closed even when its lead still needs a retry.
+          if (this.sandwichCalls.get(sessionId) === call)
+            this.sandwichCalls.delete(sessionId);
+        }
         call.onEvent({ type: 'session-closed' });
       })().catch((error) => {
         call.closing = undefined;
@@ -623,7 +633,8 @@ export class VoiceService implements OnModuleDestroy {
       return call.closing;
     }
     const session = this.sessions.get(sessionId);
-    if (!session) return Promise.resolve();
+    // An End Call retry can save the lead without retaining a dead transport.
+    if (!session) return this.leadCapture.finalizeSession(sessionId);
     if (session.closing) return session.closing;
     if (session.outputAudioTimer) clearTimeout(session.outputAudioTimer);
     if (session.silenceTimer) clearTimeout(session.silenceTimer);
@@ -640,9 +651,12 @@ export class VoiceService implements OnModuleDestroy {
         session.ws.readyState === WebSocket.CONNECTING
       )
         session.ws.close();
-      await this.leadCapture.finalizeSession(sessionId);
-      if (this.sessions.get(sessionId) === session)
-        this.sessions.delete(sessionId);
+      try {
+        await this.leadCapture.finalizeSession(sessionId);
+      } finally {
+        if (this.sessions.get(sessionId) === session)
+          this.sessions.delete(sessionId);
+      }
       session.onEvent({ type: 'session-closed' });
     })().catch((error) => {
       session.closing = undefined;
@@ -696,6 +710,6 @@ export class VoiceService implements OnModuleDestroy {
   // ─── System prompt & tools ───────────────────────────────────────────────────
 
   public getSystemPrompt(): string {
-    return LEMANS_SYSTEM_PROMPT;
+    return `${LEMANS_SYSTEM_PROMPT}\n${getEventDateContext()}`;
   }
 }

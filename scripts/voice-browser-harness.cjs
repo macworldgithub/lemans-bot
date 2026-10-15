@@ -19,6 +19,7 @@ Module({
     {
       provide: LeadCaptureService,
       useValue: {
+        hasPendingFinalization: () => false,
         startSession() {},
         appendTranscript() {},
         captureLead: async () => ({

@@ -61,6 +61,9 @@ async function settle() {
 describe('AriService phone startup', () => {
   let service: AriService;
   let api: Harness;
+  let finalizeExternalSession: jest.Mock;
+  let appendExternalTranscript: jest.Mock;
+  let handleExternalDelegation: jest.Mock;
   let request: jest.Mock<
     Promise<{ data: object }>,
     [{ url: string; params?: { variable?: string; channel?: string } }]
@@ -101,16 +104,19 @@ describe('AriService phone startup', () => {
       sendUlawToCall: jest.fn(),
       flushQueue: jest.fn(),
     };
+    finalizeExternalSession = jest.fn().mockResolvedValue(undefined);
+    appendExternalTranscript = jest.fn();
+    handleExternalDelegation = jest.fn();
     service = new AriService(
       config,
       rtp as unknown as AriRtpMediaService,
       {} as AriWebSocketGateway,
       {
         getSystemPrompt: () => 'System prompt',
-        handleExternalDelegation: jest.fn(),
+        handleExternalDelegation,
         startExternalSession: jest.fn(),
-        appendExternalTranscript: jest.fn(),
-        finalizeExternalSession: jest.fn().mockResolvedValue(undefined),
+        appendExternalTranscript,
+        finalizeExternalSession,
       } as unknown as VoiceService,
     );
     api = service as unknown as Harness;
@@ -227,6 +233,133 @@ describe('AriService phone startup', () => {
     ).toHaveLength(1);
     expect(sockets.instances).toHaveLength(1);
   });
+
+  it.each([
+    { channelId: 'extmedia-phone', expectedInboundHangups: 1 },
+    { channelId: 'phone', expectedInboundHangups: 0 },
+  ])(
+    'cleans up $channelId with $expectedInboundHangups inbound hangup requests',
+    async ({ channelId, expectedInboundHangups }) => {
+      await api.handleStasisStart({ channel: { id: 'phone' } });
+      const ws = ready();
+
+      // Asterisk may emit both StasisEnd and ChannelDestroyed for a channel.
+      await Promise.all([
+        api.handleChannelCleanup({ channel: { id: channelId } }),
+        api.handleChannelCleanup({ channel: { id: channelId } }),
+        api.handleChannelCleanup({ channel: { id: 'extmedia-phone' } }),
+      ]);
+
+      const deletions = request.mock.calls
+        .map(([options]) => options as { url: string; method: string })
+        .filter((options) => options.method === 'delete');
+      expect(
+        deletions.filter((options) => options.url.endsWith('/channels/phone')),
+      ).toHaveLength(expectedInboundHangups);
+      expect(
+        deletions.filter((options) =>
+          options.url.endsWith('/channels/extmedia-phone'),
+        ),
+      ).toHaveLength(1);
+      expect(
+        deletions.filter((options) =>
+          options.url.endsWith('/bridges/bridge-phone'),
+        ),
+      ).toHaveLength(1);
+      expect(ws.close).toHaveBeenCalledTimes(1);
+      expect(rtp.unregisterCallSession).toHaveBeenCalledTimes(1);
+      expect(finalizeExternalSession).toHaveBeenCalledTimes(1);
+      expect(finalizeExternalSession).toHaveBeenCalledWith('phone');
+      expect(api.sessions.size).toBe(0);
+      expect(api.aiSessions.size).toBe(0);
+    },
+  );
+
+  it('preserves transcripts arriving after hangup before finalizing, with a bounded drain', async () => {
+    jest.useFakeTimers();
+    const saved = deferred<void>();
+    try {
+      await api.handleStasisStart({ channel: { id: 'phone' } });
+      const ws = ready();
+      finalizeExternalSession.mockReturnValue(saved.promise);
+      const cleanup = api.handleChannelCleanup({ channel: { id: 'phone' } });
+      const duplicate = api.handleChannelCleanup({ channel: { id: 'phone' } });
+      expect(rtp.unregisterCallSession).toHaveBeenCalledWith('phone');
+      expect(ws.close).not.toHaveBeenCalled();
+      expect(finalizeExternalSession).not.toHaveBeenCalled();
+
+      await jest.advanceTimersByTimeAsync(500);
+      for (const event of [
+        {
+          type: 'session.input_transcript.delta',
+          delta: 'Actually, use 0412345678.',
+        },
+        {
+          type: 'session.output_transcript.delta',
+          delta: 'I have your correction.',
+        },
+        { type: 'session.output_audio.delta', delta: '////' },
+        { type: 'session.delegation.created', delegation: { id: 'late-task' } },
+      ]) {
+        ws.emit('message', Buffer.from(JSON.stringify(event)));
+      }
+      api.handleInboundRtpFrame('phone', Buffer.from([1, 2, 3]));
+      expect(appendExternalTranscript.mock.calls).toEqual([
+        ['phone', 'user', 'Actually, use 0412345678.'],
+        ['phone', 'assistant', 'I have your correction.'],
+      ]);
+      expect(rtp.sendUlawToCall).not.toHaveBeenCalled();
+      expect(handleExternalDelegation).not.toHaveBeenCalled();
+      expect(ws.send).toHaveBeenCalledTimes(1); // Only the original session.start.
+
+      await jest.advanceTimersByTimeAsync(249);
+      expect(finalizeExternalSession).not.toHaveBeenCalled();
+      await jest.advanceTimersByTimeAsync(1);
+      expect(ws.close).toHaveBeenCalledTimes(1);
+      expect(finalizeExternalSession).toHaveBeenCalledTimes(1);
+      expect(appendExternalTranscript.mock.invocationCallOrder[1]).toBeLessThan(
+        finalizeExternalSession.mock.invocationCallOrder[0],
+      );
+      expect(api.sessions.size).toBe(1); // Still waiting for persistence.
+      ws.emit(
+        'message',
+        Buffer.from(
+          '{"type":"session.input_transcript.delta","delta":"too late"}',
+        ),
+      );
+      expect(appendExternalTranscript).toHaveBeenCalledTimes(2);
+      saved.resolve();
+      await Promise.all([cleanup, duplicate]);
+      expect(api.sessions.size).toBe(0);
+      expect(api.aiSessions.size).toBe(0);
+      expect(jest.getTimerCount()).toBe(0);
+    } finally {
+      saved.resolve();
+      await jest.advanceTimersByTimeAsync(750);
+      jest.useRealTimers();
+    }
+  });
+
+  it.each(['close', 'error'])(
+    'finishes draining immediately on provider %s',
+    async (event) => {
+      jest.useFakeTimers();
+      try {
+        await api.handleStasisStart({ channel: { id: 'phone' } });
+        const ws = ready();
+        const cleanup = api.handleChannelCleanup({ channel: { id: 'phone' } });
+        ws.readyState = 3;
+        ws.emit(event, new Error('provider disconnected'));
+        await cleanup;
+        expect(finalizeExternalSession).toHaveBeenCalledTimes(1);
+        expect(api.sessions.size).toBe(0);
+        expect(api.aiSessions.size).toBe(0);
+        expect(jest.getTimerCount()).toBe(0);
+      } finally {
+        jest.useRealTimers();
+      }
+    },
+  );
 
   it('cleans up late-created resources after disconnect during bridge creation', async () => {
     const bridge = blockBridge();

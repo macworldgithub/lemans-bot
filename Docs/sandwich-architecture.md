@@ -47,6 +47,9 @@ ELEVENLABS_VOICE_ID=...
 # Optional settings; these are the defaults.
 VOICE_ARCHITECTURE=sandwich
 OPENAI_VOICE_MODEL=gpt-6-luna
+# The voice pipeline defaults to none for gpt-6-luna; other models retain
+# their provider default unless explicitly configured (check model support).
+OPENAI_VOICE_REASONING_EFFORT=none
 DEEPGRAM_EOT_THRESHOLD=0.7
 DEEPGRAM_EOT_TIMEOUT_MS=1500
 ```

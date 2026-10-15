@@ -63,6 +63,7 @@ type AiSession = {
   callId: string;
   ws: WebSocket;
   closed: boolean;
+  draining?: boolean;
   processingAudio: boolean;
   ready: boolean;
   pendingInput: Buffer[];
@@ -71,6 +72,8 @@ type AiSession = {
   pendingOutputBytes: number;
   startupTimer: ReturnType<typeof setTimeout> | null;
 };
+
+type PendingAriCleanup = { kind: 'channel' | 'bridge'; id: string };
 
 @Injectable()
 export class AriService implements OnModuleInit, OnModuleDestroy {
@@ -83,6 +86,10 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
   private readonly sessions = new Map<string, AriCallSession>();
   private readonly aiSessions = new Map<string, AiSession>();
   private reconnectTimer: NodeJS.Timeout | null = null;
+  private reconciliationTimer: NodeJS.Timeout | null = null;
+  private cleanupRetryTimer: NodeJS.Timeout | null = null;
+  private readonly pendingCleanups = new Map<string, PendingAriCleanup>();
+  private readonly cleanupsInFlight = new Set<string>();
   private readonly maxStartupAudioBytes = 80_000;
 
   constructor(
@@ -129,6 +136,10 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
 
   async onModuleDestroy() {
     this.stopping = true;
+    this.connected = false;
+    this.clearReconciliationRetry();
+    if (this.cleanupRetryTimer) clearTimeout(this.cleanupRetryTimer);
+    this.cleanupRetryTimer = null;
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -165,6 +176,8 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
 
   private connectEventSocket() {
     if (this.stopping) return;
+    this.connected = false;
+    this.clearReconciliationRetry();
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -196,16 +209,20 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
       return;
     }
 
+    const socket = this.eventSocket;
     this.eventSocket.on('open', () => {
+      if (this.stopping || this.eventSocket !== socket) return;
       this.connected = true;
       if (this.reconnectTimer) {
         clearTimeout(this.reconnectTimer);
         this.reconnectTimer = null;
       }
       this.logger.log('ARI event socket connected');
+      void this.reconcileSessions(socket);
     });
 
     this.eventSocket.on('message', async (rawData: WebSocket.RawData) => {
+      if (this.stopping || this.eventSocket !== socket) return;
       this.lastEventAt = new Date().toISOString();
 
       try {
@@ -232,7 +249,9 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
     });
 
     this.eventSocket.on('close', (code, reason) => {
+      if (this.eventSocket !== socket) return;
       this.connected = false;
+      this.clearReconciliationRetry();
       this.logger.warn(
         `ARI event socket disconnected (code=${code}, reason=${reason?.toString() || 'none'})`,
       );
@@ -240,10 +259,82 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
     });
 
     this.eventSocket.on('error', (error) => {
+      if (this.eventSocket !== socket) return;
       this.connected = false;
+      this.clearReconciliationRetry();
       this.logger.error(`ARI event socket error: ${error.message}`);
       this.scheduleReconnect();
     });
+  }
+
+  private isCurrentEventSocket(socket: WebSocket): boolean {
+    return !this.stopping && this.connected && this.eventSocket === socket;
+  }
+
+  private clearReconciliationRetry(): void {
+    if (this.reconciliationTimer) clearTimeout(this.reconciliationTimer);
+    this.reconciliationTimer = null;
+  }
+
+  private scheduleReconciliationRetry(socket: WebSocket): void {
+    if (!this.isCurrentEventSocket(socket) || this.reconciliationTimer) return;
+    this.reconciliationTimer = setTimeout(() => {
+      this.reconciliationTimer = null;
+      void this.reconcileSessions(socket);
+    }, 3000);
+  }
+
+  private async channelExists(channelId: string): Promise<boolean> {
+    try {
+      const channel = await this.ariRequest<{ id: string }>(
+        'get',
+        `/channels/${encodeURIComponent(channelId)}`,
+      );
+      if (channel?.id !== channelId)
+        throw new Error('Invalid ARI channel response');
+      return true;
+    } catch (error) {
+      if (axios.isAxiosError(error) && error.response?.status === 404)
+        return false;
+      throw error;
+    }
+  }
+
+  private async reconcileSessions(socket: WebSocket): Promise<void> {
+    let needsRetry = false;
+    // Snapshot identities so a slow check cannot clean a new call with the same ID.
+    for (const session of [...this.sessions.values()]) {
+      if (!this.isCurrentEventSocket(socket)) return;
+      if (session.ended) continue;
+      const stillCurrent = () =>
+        this.isCurrentEventSocket(socket) &&
+        !session.ended &&
+        this.sessions.get(session.callId) === session;
+      try {
+        const callerExists = await this.channelExists(session.inboundChannelId);
+        if (!stillCurrent()) continue;
+        if (!callerExists) {
+          await this.cleanupSession(session.callId);
+          continue;
+        }
+        // Startup is allowed to create its media channel after this check begins.
+        if (session.mediaReady && session.externalMediaChannelId) {
+          const mediaExists = await this.channelExists(
+            session.externalMediaChannelId,
+          );
+          if (stillCurrent() && !mediaExists) {
+            await this.cleanupSession(session.callId, true);
+          }
+        }
+      } catch {
+        if (!stillCurrent()) continue;
+        this.logger.warn(
+          `ARI channel verification deferred; call=${session.callId}`,
+        );
+        needsRetry = true;
+      }
+    }
+    if (needsRetry) this.scheduleReconciliationRetry(socket);
   }
 
   private scheduleReconnect(delayMs = 3000) {
@@ -412,7 +503,11 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
       return;
     }
 
-    await this.cleanupSession(session.callId);
+    // Losing the audio channel leaves the caller connected unless we hang up too.
+    // Ignore media-end events caused by cleanup that is already in progress.
+    const mediaFailed =
+      channelId === session.externalMediaChannelId && !session.ended;
+    await this.cleanupSession(session.callId, mediaFailed);
   }
 
   private findSessionByChannel(channelId: string): AriCallSession | undefined {
@@ -439,7 +534,7 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
     session.farewellTimer = null;
     session.hangupTimer = null;
     session.turns.close();
-    this.cleanupAiSession(callId);
+    const aiDrain = this.drainAiSession(callId);
     if (session.sandwichWebSocket)
       this.ariWebSocketGateway.closeCallConnection(callId);
     this.ariRtpMediaService.unregisterCallSession(callId);
@@ -448,6 +543,7 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
         await this.voiceService.closePhonePipeline(callId);
         await session.sandwichStartup.catch(() => {});
       }
+      await aiDrain;
       await this.voiceService.finalizeExternalSession(callId);
     })().catch(() => {
       this.logger.error(`[${callId}] Final lead persistence failed`);
@@ -875,13 +971,30 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
   private handleAiRealtimeEvent(callId: string, rawEvent: string) {
     const ai = this.aiSessions.get(callId);
     const call = this.sessions.get(callId);
-    if (!ai || ai.closed || !call || call.ended) return;
+    if (!ai || ai.closed || !call || (call.ended && !ai.draining)) return;
     try {
       const event = JSON.parse(rawEvent) as {
         type?: string;
         delta?: string;
         delegation?: { id?: string; name?: string };
       };
+      if (ai.draining) {
+        // Audio already sent can still produce transcripts after the caller hangs up.
+        // Do not start replies, delegation, or farewell timers during cleanup.
+        if (
+          event.type === 'session.input_transcript.delta' ||
+          event.type === 'session.output_transcript.delta'
+        ) {
+          this.voiceService.appendExternalTranscript(
+            callId,
+            event.type === 'session.input_transcript.delta'
+              ? 'user'
+              : 'assistant',
+            event.delta ?? '',
+          );
+        }
+        return;
+      }
       switch (event.type) {
         case 'session.started':
           if (ai.ready) return;
@@ -1138,6 +1251,26 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
     await this.cleanupSession(callId, true);
   }
 
+  private async drainAiSession(callId: string): Promise<void> {
+    const ai = this.aiSessions.get(callId);
+    if (ai?.ready && !ai.closed && ai.ws.readyState === WebSocket.OPEN) {
+      ai.draining = true;
+      // Bound the wait so a silent or broken provider cannot block finalization.
+      await new Promise<void>((resolve) => {
+        const finish = () => {
+          clearTimeout(timeout);
+          ai.ws.removeListener('close', finish);
+          ai.ws.removeListener('error', finish);
+          resolve();
+        };
+        const timeout = setTimeout(finish, 750);
+        ai.ws.once('close', finish);
+        ai.ws.once('error', finish);
+      });
+    }
+    this.cleanupAiSession(callId);
+  }
+
   private cleanupAiSession(callId: string) {
     const aiSession = this.aiSessions.get(callId);
     if (!aiSession) {
@@ -1253,29 +1386,73 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async safeHangupChannel(channelId: string) {
-    try {
-      await this.ariRequest(
-        'delete',
-        `/channels/${encodeURIComponent(channelId)}`,
-      );
-    } catch (error) {
-      this.logger.warn(
-        `Failed to hangup channel ${channelId}: ${(error as Error).message}`,
-      );
-    }
+    await this.cleanupAriResource('channel', channelId);
   }
 
   private async safeDestroyBridge(bridgeId: string) {
+    await this.cleanupAriResource('bridge', bridgeId);
+  }
+
+  private cleanupKey(resource: PendingAriCleanup): string {
+    return `${resource.kind}:${resource.id}`;
+  }
+
+  private async cleanupAriResource(
+    kind: PendingAriCleanup['kind'],
+    id: string,
+  ): Promise<void> {
+    const resource = { kind, id };
+    const key = this.cleanupKey(resource);
+    this.pendingCleanups.set(key, resource);
+    await this.attemptAriCleanup(key, resource);
+  }
+
+  private async attemptAriCleanup(
+    key: string,
+    resource: PendingAriCleanup,
+  ): Promise<void> {
+    if (this.cleanupsInFlight.has(key)) return;
+    this.cleanupsInFlight.add(key);
     try {
+      const path = resource.kind === 'channel' ? 'channels' : 'bridges';
       await this.ariRequest(
         'delete',
-        `/bridges/${encodeURIComponent(bridgeId)}`,
+        `/${path}/${encodeURIComponent(resource.id)}`,
       );
+      this.pendingCleanups.delete(key);
     } catch (error) {
-      this.logger.warn(
-        `Failed to destroy bridge ${bridgeId}: ${(error as Error).message}`,
-      );
+      // A 404 means the resource is already gone, which is the desired state.
+      if (axios.isAxiosError(error) && error.response?.status === 404) {
+        this.pendingCleanups.delete(key);
+      } else {
+        this.logger.warn(
+          `ARI ${resource.kind} cleanup deferred; id=${resource.id}`,
+        );
+      }
+    } finally {
+      this.cleanupsInFlight.delete(key);
+      if (this.pendingCleanups.size > 0) this.scheduleCleanupRetry();
+      else if (this.cleanupRetryTimer) {
+        clearTimeout(this.cleanupRetryTimer);
+        this.cleanupRetryTimer = null;
+      }
     }
+  }
+
+  private scheduleCleanupRetry(): void {
+    if (this.stopping || this.cleanupRetryTimer) return;
+    this.cleanupRetryTimer = setTimeout(() => {
+      this.cleanupRetryTimer = null;
+      void this.retryPendingCleanups();
+    }, 3000);
+  }
+
+  private async retryPendingCleanups(): Promise<void> {
+    await Promise.all(
+      [...this.pendingCleanups.entries()].map(([key, resource]) =>
+        this.attemptAriCleanup(key, resource),
+      ),
+    );
   }
 
   private async ariRequest<T = unknown>(

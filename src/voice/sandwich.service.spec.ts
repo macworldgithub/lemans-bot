@@ -51,6 +51,7 @@ describe('Sandwich streaming pipeline', () => {
   let options: SandwichOptions;
   let stt: Socket;
   let tts: Socket;
+  let values: Record<string, string>;
   beforeEach(() => {
     jest.useFakeTimers();
     sockets.instances = [];
@@ -63,7 +64,7 @@ describe('Sandwich streaming pipeline', () => {
     (OpenAI as unknown as jest.Mock).mockImplementation(() => ({
       responses: { create },
     }));
-    const values = {
+    values = {
       OPENAI_API_KEY: 'test',
       ELEVENLABS_API_KEY: 'test',
       ELEVENLABS_VOICE_ID: 'voice',
@@ -109,6 +110,28 @@ describe('Sandwich streaming pipeline', () => {
       .map(([data]) => JSON.parse(data))
       .find((event) => event.text === ' ').context_id;
   }
+  it.each([
+    { model: 'gpt-6-luna', configured: undefined, expected: 'none' },
+    { model: 'gpt-6-luna', configured: 'medium', expected: 'medium' },
+    { model: 'gpt-4.1-mini', configured: undefined, expected: undefined },
+  ])(
+    'uses voice reasoning $expected for $model with override $configured',
+    async ({ model, configured, expected }) => {
+      values.OPENAI_VOICE_MODEL = model;
+      if (configured) values.OPENAI_VOICE_REASONING_EFFORT = configured;
+      await connect();
+      turn();
+      await settle();
+      expect(create).toHaveBeenCalledWith(
+        expect.objectContaining({ model }),
+        expect.anything(),
+      );
+      expect(create.mock.calls[0][0].reasoning).toEqual(
+        expected === undefined ? undefined : { effort: expected },
+      );
+      expect(tts.send).toHaveBeenCalled();
+    },
+  );
   it('requires Flux readiness and uses matching web and phone codecs with header auth', async () => {
     await connect({
       ...options,

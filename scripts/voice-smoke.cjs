@@ -3,7 +3,24 @@ const { ConfigService } = require('@nestjs/config');
 const { SandwichService } = require('../dist/voice/sandwich.service');
 const { performance } = require('node:perf_hooks');
 const fs = require('node:fs');
+const {
+  LEMANS_SYSTEM_PROMPT,
+  getEventDateContext,
+} = require('../dist/voice/lemans-knowledge');
 process.loadEnvFile('.env');
+const argument = (name) =>
+  process.argv
+    .find((item) => item.startsWith(`--${name}=`))
+    ?.split('=')
+    .slice(1)
+    .join('=');
+const runs = Number(argument('runs') ?? 1);
+if (!Number.isInteger(runs) || runs < 1 || runs > 5)
+  throw new Error('--runs must be 1 through 5');
+const productionPrompt = process.argv.includes('--production-prompt');
+const effort = argument('reasoning');
+const label = argument('label') ?? 'results';
+if (!/^[a-z0-9-]+$/i.test(label)) throw new Error('Invalid test label');
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const results = [];
 
@@ -32,9 +49,11 @@ async function fixture(format) {
   fs.writeFileSync(path, audio);
   return audio;
 }
-async function run(mode, audio) {
-  const service = new SandwichService(new ConfigService(process.env));
-  const id = `smoke-${mode}`;
+async function run(mode, audio, iteration) {
+  const config = { ...process.env };
+  if (effort) config.OPENAI_VOICE_REASONING_EFFORT = effort;
+  const service = new SandwichService(new ConfigService(config));
+  const id = `smoke-${mode}-${iteration}`;
   const metrics = [];
   let lastInputAt = null;
   let firstAudioAt = null;
@@ -54,8 +73,9 @@ async function run(mode, audio) {
       inputEncoding: mode === 'web' ? 'linear16' : 'mulaw',
       inputRate: mode === 'web' ? 24000 : 8000,
       outputFormat: mode === 'web' ? 'pcm_24000' : 'ulaw_8000',
-      instructions:
-        'You are Chloe from Le Mans Entertainment. Answer the caller briefly. We offer go-karting, VR and laser tag. Ask one follow-up question.',
+      instructions: productionPrompt
+        ? `${LEMANS_SYSTEM_PROMPT}\n${getEventDateContext()}`
+        : 'You are Chloe from Le Mans Entertainment. Answer the caller briefly. We offer go-karting, VR and laser tag. Ask one follow-up question.',
       onTranscript: (role) => {
         if (role === 'user') turns++;
       },
@@ -97,6 +117,7 @@ async function run(mode, audio) {
     await sleep(500);
     results.push({
       mode,
+      iteration,
       startupMs,
       userTurns: turns,
       responseAudioBytes: bytes,
@@ -119,25 +140,37 @@ async function run(mode, audio) {
   }
 }
 (async () => {
-  for (const mode of ['web', 'phone']) {
-    try {
-      await run(
-        mode,
-        await fixture(mode === 'web' ? 'pcm_24000' : 'ulaw_8000'),
-      );
-    } catch (error) {
-      results.push({
-        mode,
-        result: 'failed',
-        error: error.message,
-        networkCode: error.cause?.code,
-      });
+  for (let iteration = 1; iteration <= runs; iteration++) {
+    for (const mode of ['web', 'phone']) {
+      try {
+        await run(
+          mode,
+          await fixture(mode === 'web' ? 'pcm_24000' : 'ulaw_8000'),
+          iteration,
+        );
+      } catch (error) {
+        results.push({
+          mode,
+          result: 'failed',
+          error: error.message,
+          networkCode: error.cause?.code,
+        });
+      }
     }
   }
   fs.mkdirSync('.tmp', { recursive: true });
   fs.writeFileSync(
-    '.tmp/voice-smoke-results.json',
-    JSON.stringify({ testedAt: new Date().toISOString(), results }, null, 2),
+    `.tmp/voice-smoke-${label}.json`,
+    JSON.stringify(
+      {
+        testedAt: new Date().toISOString(),
+        productionPrompt,
+        reasoning: effort ?? '(voice default)',
+        results,
+      },
+      null,
+      2,
+    ),
   );
   console.log(JSON.stringify(results, null, 2));
   if (results.some((result) => result.result === 'failed'))

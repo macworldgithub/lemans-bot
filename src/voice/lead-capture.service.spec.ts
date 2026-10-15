@@ -1,7 +1,7 @@
 import { ConfigService } from '@nestjs/config';
 import { Model, Mongoose } from 'mongoose';
 import OpenAI from 'openai';
-import { ActiveCampaignService } from '../integrations/active-campaign.service';
+import { CrmDeliveryService } from '../integrations/crm-delivery.service';
 import { LeadSchema as TradieLeadSchema } from '../lead/schemas/lead.schema';
 import { LeadCaptureService, LeadFields } from './lead-capture.service';
 import {
@@ -10,6 +10,8 @@ import {
   VOICE_LEAD_MODEL,
 } from './schemas/lead.schema';
 import { SAVE_LEAD_TOOL } from './lemans-knowledge';
+import { VoiceService } from './voice.service';
+import { SandwichService } from './sandwich.service';
 
 jest.mock('openai', () => ({ __esModule: true, default: jest.fn() }));
 
@@ -29,22 +31,20 @@ describe('LeadCaptureService', () => {
   let backend: jest.Mock;
   let records: Map<string, Record<string, unknown>>;
   let leads: { findOneAndUpdate: jest.Mock; updateOne: jest.Mock };
-  let crm: { createContact: jest.Mock };
+  let crm: { wake: jest.Mock };
   let saved: jest.Mock;
 
   beforeEach(() => {
     jest.useFakeTimers();
-    backend = jest
-      .fn()
-      .mockResolvedValue({
-        output: [
-          {
-            type: 'function_call',
-            name: 'save_lead',
-            arguments: JSON.stringify(fields),
-          },
-        ],
-      });
+    backend = jest.fn().mockResolvedValue({
+      output: [
+        {
+          type: 'function_call',
+          name: 'save_lead',
+          arguments: JSON.stringify(fields),
+        },
+      ],
+    });
     jest
       .mocked(OpenAI)
       .mockImplementation(
@@ -61,7 +61,7 @@ describe('LeadCaptureService', () => {
       })),
       updateOne: jest.fn(() => ({ exec: async () => ({}) })),
     };
-    crm = { createContact: jest.fn().mockResolvedValue(null) };
+    crm = { wake: jest.fn() };
     saved = jest.fn();
     service = new LeadCaptureService(
       {
@@ -69,7 +69,7 @@ describe('LeadCaptureService', () => {
           key === 'OPENAI_API_KEY' ? 'test-key' : undefined,
       } as unknown as ConfigService,
       leads as unknown as Model<LeadDocument>,
-      crm as unknown as ActiveCampaignService,
+      crm as unknown as CrmDeliveryService,
     );
   });
 
@@ -155,9 +155,47 @@ describe('LeadCaptureService', () => {
       groupSize: 20,
       eventDate: 'Sunday',
     });
-    expect(crm.createContact).not.toHaveBeenCalled();
+    expect(crm.wake).not.toHaveBeenCalled();
     await service.finalizeSession('browser');
-    expect(crm.createContact).toHaveBeenCalledTimes(1);
+    expect(crm.wake).toHaveBeenCalledTimes(1);
+    expect([...records.values()][0]).toMatchObject({
+      crmStatus: 'pending',
+      crmNextAttemptAt: expect.any(String),
+      groupSize: 20,
+      eventDate: 'Sunday',
+    });
+  });
+
+  it('does not lose the delivery obligation when the final database write fails', async () => {
+    start();
+    transcript();
+    await service.captureLead('browser');
+    const normal = leads.findOneAndUpdate.getMockImplementation()!;
+    let fail = true;
+    leads.findOneAndUpdate.mockImplementation((filter, update) => {
+      if (update.$set.crmStatus === 'pending' && fail) {
+        fail = false;
+        return {
+          exec: async () => {
+            throw new Error('DB offline');
+          },
+        };
+      }
+      return normal(filter, update);
+    });
+    await expect(service.finalizeSession('browser')).rejects.toThrow(
+      'DB offline',
+    );
+    expect(crm.wake).not.toHaveBeenCalled();
+    expect([...records.values()][0].crmStatus).toBeUndefined();
+    await jest.advanceTimersByTimeAsync(5000);
+    expect(records.size).toBe(1);
+    expect([...records.values()][0]).toMatchObject({
+      crmStatus: 'pending',
+      captureStatus: 'complete',
+      endedAt: expect.any(String),
+    });
+    expect(crm.wake).toHaveBeenCalledTimes(1);
   });
 
   it('creates different records for repeated calls on the same connection, including silent calls', async () => {
@@ -219,7 +257,7 @@ describe('LeadCaptureService', () => {
         extractionStatus: 'failed',
       });
       expect(String(row.callerTranscript)).toContain('Zero four one two');
-      expect(crm.createContact).not.toHaveBeenCalled();
+      expect([...records.values()][0].crmStatus).toBeUndefined();
     },
   );
 
@@ -291,6 +329,55 @@ describe('LeadCaptureService', () => {
     expect(records.size).toBe(1);
     expect([...records.values()][0].endedAt).toBeTruthy();
     expect(saved).toHaveBeenCalledTimes(1);
+  });
+
+  it('releases a failed browser session while retrying its lead, then permits a separate new call', async () => {
+    const pipeline = {
+      createSession: jest.fn().mockResolvedValue(undefined),
+      speak: jest.fn(),
+      closeSession: jest.fn().mockResolvedValue(undefined),
+    };
+    const voice = new VoiceService(
+      { get: () => undefined } as unknown as ConfigService,
+      service,
+      pipeline as unknown as SandwichService,
+    );
+    const events = jest.fn();
+    await voice.createRealtimeSession('browser', events);
+    voice.triggerGreeting('browser');
+    await jest.advanceTimersByTimeAsync(0);
+    const originalId = [...records.keys()][0];
+    leads.findOneAndUpdate.mockImplementationOnce(() => ({
+      exec: async () => {
+        throw new Error('DB offline');
+      },
+    }));
+
+    const close = voice.closeSession('browser');
+    expect(voice.closeSession('browser')).toBe(close);
+    await expect(close).rejects.toThrow('DB offline');
+    expect(voice.hasSession('browser')).toBe(false);
+    expect(pipeline.closeSession).toHaveBeenCalledTimes(1);
+    expect(events).not.toHaveBeenCalledWith({ type: 'session-closed' });
+    await expect(
+      voice.createRealtimeSession('browser', events),
+    ).rejects.toThrow('Previous call details are still being saved');
+    expect(pipeline.createSession).toHaveBeenCalledTimes(1);
+
+    await jest.advanceTimersByTimeAsync(5000);
+    expect(voice.hasSession('browser')).toBe(false);
+    expect([...records.keys()]).toEqual([originalId]);
+    expect(records.get(originalId)?.endedAt).toBeTruthy();
+    expect(events).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'lead-saved' }),
+    );
+
+    await voice.createRealtimeSession('browser', events);
+    voice.triggerGreeting('browser');
+    await voice.closeSession('browser');
+    expect(records.size).toBe(2);
+    expect(voice.hasSession('browser')).toBe(false);
+    expect(jest.getTimerCount()).toBe(0);
   });
 
   it('saves active calls during graceful shutdown', async () => {

@@ -59,6 +59,30 @@ export class Lead {
   @Prop()
   activeCampaignContactId: string;
 
+  @Prop({
+    enum: ['not_required', 'pending', 'processing', 'synced'],
+    default: 'not_required',
+  })
+  crmStatus: string;
+
+  @Prop({ default: 0 })
+  crmAttempts: number;
+
+  @Prop({ type: Date })
+  crmNextAttemptAt?: Date;
+
+  @Prop({ type: Date })
+  crmLeaseUntil?: Date;
+
+  @Prop()
+  crmLeaseToken?: string;
+
+  @Prop()
+  crmLastError?: string;
+
+  @Prop({ type: Date })
+  crmSyncedAt?: Date;
+
   @Prop({ type: String, default: 'LeMans Inquiries' })
   assignedTo: string;
 
@@ -101,3 +125,5 @@ export class Lead {
 }
 
 export const LeadSchema = SchemaFactory.createForClass(Lead);
+LeadSchema.index({ crmStatus: 1, crmNextAttemptAt: 1 });
+LeadSchema.index({ crmStatus: 1, crmLeaseUntil: 1 });

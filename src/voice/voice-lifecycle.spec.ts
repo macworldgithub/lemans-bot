@@ -31,6 +31,7 @@ const sockets = WebSocket as unknown as { instances: FakeSocket[] };
 describe('VoiceService lead lifecycle', () => {
   let service: VoiceService;
   let capture: {
+    hasPendingFinalization: jest.Mock;
     startSession: jest.Mock;
     appendTranscript: jest.Mock;
     captureLead: jest.Mock;
@@ -42,6 +43,7 @@ describe('VoiceService lead lifecycle', () => {
     jest.useFakeTimers();
     sockets.instances = [];
     capture = {
+      hasPendingFinalization: jest.fn().mockReturnValue(false),
       startSession: jest.fn(),
       appendTranscript: jest.fn(),
       captureLead: jest.fn().mockResolvedValue({ capture_status: 'complete' }),
@@ -170,6 +172,26 @@ describe('VoiceService lead lifecycle', () => {
     saved();
     await first;
     expect(events).toHaveBeenCalledWith({ type: 'session-closed' });
+  });
+
+  it('removes a closed Live session after a failed save and allows persistence-only retry', async () => {
+    const ws = await connect();
+    service.triggerGreeting('browser');
+    capture.finalizeSession.mockRejectedValueOnce(new Error('DB offline'));
+    const close = service.closeSession('browser');
+    expect(service.closeSession('browser')).toBe(close);
+    const failure = expect(close).rejects.toThrow('DB offline');
+    await jest.advanceTimersByTimeAsync(750);
+    await failure;
+    expect(ws.close).toHaveBeenCalledTimes(1);
+    expect(service.hasSession('browser')).toBe(false);
+    expect(events).not.toHaveBeenCalledWith({ type: 'session-closed' });
+
+    await service.closeSession('browser');
+    expect(capture.finalizeSession).toHaveBeenCalledTimes(2);
+    expect(ws.close).toHaveBeenCalledTimes(1);
+    expect(service.hasSession('browser')).toBe(false);
+    expect(jest.getTimerCount()).toBe(0);
   });
 
   it('finalizes on provider disconnect without a delegation', async () => {

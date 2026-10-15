@@ -4,9 +4,9 @@ import { InjectModel } from '@nestjs/mongoose';
 import { randomUUID } from 'node:crypto';
 import { Model, Types } from 'mongoose';
 import OpenAI from 'openai';
-import { ActiveCampaignService } from '../integrations/active-campaign.service';
+import { CrmDeliveryService } from '../integrations/crm-delivery.service';
 import { LeadDocument, VOICE_LEAD_MODEL } from './schemas/lead.schema';
-import { SAVE_LEAD_TOOL } from './lemans-knowledge';
+import { getEventDateContext, SAVE_LEAD_TOOL } from './lemans-knowledge';
 
 export interface LeadFields {
   caller_name: string | null;
@@ -68,13 +68,17 @@ export class LeadCaptureService implements BeforeApplicationShutdown {
   constructor(
     private readonly config: ConfigService,
     @InjectModel(VOICE_LEAD_MODEL) private readonly leads: Model<LeadDocument>,
-    private readonly activeCampaign: ActiveCampaignService,
+    private readonly crmDelivery: CrmDeliveryService,
   ) {}
 
   async beforeApplicationShutdown(): Promise<void> {
     await Promise.allSettled(
       [...this.sessions.keys()].map((key) => this.finalizeSession(key)),
     );
+  }
+
+  hasPendingFinalization(key: string): boolean {
+    return this.sessions.get(key)?.endedAt !== undefined;
   }
 
   startSession(
@@ -181,9 +185,10 @@ export class LeadCaptureService implements BeforeApplicationShutdown {
           );
         }
       }
-      await this.persist(session);
+      // Save the final lead and its delivery obligation atomically in one document.
+      await this.persist(session, true);
+      this.crmDelivery.wake();
       session.onSaved?.(this.result(session));
-      this.syncCrm(session);
       this.sessions.delete(key);
     });
     session.finalization = finalization.catch((error) => {
@@ -209,7 +214,7 @@ export class LeadCaptureService implements BeforeApplicationShutdown {
     const response = await this.client.responses
       .create({
         model: this.config.get<string>('OPENAI_LEAD_MODEL') ?? 'gpt-6-luna',
-        instructions: EXTRACTION_INSTRUCTIONS,
+        instructions: `${EXTRACTION_INSTRUCTIONS}\n${getEventDateContext(session.startedAt)}`,
         input: JSON.stringify({
           inboundCallerNumber: session.callerNumber,
           previousFields: session.fields ?? null,
@@ -322,7 +327,10 @@ export class LeadCaptureService implements BeforeApplicationShutdown {
     };
   }
 
-  private async persist(session: CaptureSession): Promise<void> {
+  private async persist(
+    session: CaptureSession,
+    queueCrm = false,
+  ): Promise<void> {
     const fields = session.fields;
     const result = this.result(session);
     const callerTranscript = session.conversation
@@ -334,6 +342,9 @@ export class LeadCaptureService implements BeforeApplicationShutdown {
         { _id: session.id },
         {
           $set: {
+            ...(queueCrm && result.capture_status === 'complete'
+              ? { crmStatus: 'pending', crmNextAttemptAt: new Date() }
+              : {}),
             callId: session.callId,
             callerName: fields?.caller_name ?? null,
             callerNumber: result.caller_number,
@@ -371,58 +382,5 @@ export class LeadCaptureService implements BeforeApplicationShutdown {
       `[${session.callId}] Lead persistence failed; lead_id=${session.id}`,
     );
     session.onError?.();
-  }
-
-  private syncCrm(session: CaptureSession): void {
-    const fields = session.fields;
-    const result = this.result(session);
-    if (result.capture_status !== 'complete' || !fields?.caller_name) return;
-    void this.activeCampaign
-      .createContact({
-        firstName: fields.caller_name,
-        phone: result.caller_number as string,
-        email: fields.caller_email ?? undefined,
-        tag: (
-          {
-            kids_party: 'KidsParty',
-            teen_party: 'TeenParty',
-            buck_party: 'BucksHens',
-            corporate: 'Corporate',
-            adult_party: 'AdultParty',
-            karts: 'Karts',
-            vr: 'VR',
-            activities: 'Activities',
-            booking_change: 'BookingChange',
-            complaint: 'Complaint',
-            after_hours: 'AfterHours',
-            school_group: 'SchoolGroup',
-            emergency: 'Emergency',
-            general_enquiry: 'GeneralEnquiry',
-            unknown: 'Unknown',
-          } as Record<string, string>
-        )[fields.event_type],
-        fieldValues: [
-          { field: 'EVENT_TYPE', value: fields.event_type },
-          { field: 'EVENT_DATE', value: fields.event_date ?? '' },
-          { field: 'GROUP_SIZE', value: String(fields.group_size ?? '') },
-          { field: 'ENQUIRY', value: fields.enquiry_details ?? '' },
-          { field: 'ASSIGNED_TO', value: result.assignedTo as string },
-        ],
-      })
-      .then(async (response) => {
-        if (response?.contact?.id) {
-          await this.leads
-            .updateOne(
-              { _id: session.id },
-              { $set: { activeCampaignContactId: response.contact.id } },
-            )
-            .exec();
-        }
-      })
-      .catch(() =>
-        this.logger.warn(
-          `[${session.callId}] CRM sync failed; database lead retained`,
-        ),
-      );
   }
 }
