@@ -1,0 +1,10 @@
+{
+  "text": "Hi, you've reached Le Mans Entertainment. I'm Chloe. How can I help you today?",
+  "transcript": "Hi, you've reached Le Mans Entertainment. I'm Chloe. How can I help you today?",
+  "model": "gpt-live-1",
+  "voice": "quartz",
+  "sampleRate": 8000,
+  "encoding": "mulaw",
+  "durationMs": 4659,
+  "sha256": "cf9bcba14e769fddafad32883e72d37df3fa0db205b7aa729879de15b23c107e"
+}

@@ -7,6 +7,7 @@ import { AriRtpMediaService } from './ari-rtp-media.service';
 import { AriWebSocketGateway } from './ari-websocket.gateway';
 import { VoiceService } from '../voice/voice.service';
 import { CallLatency } from './call-latency';
+import { LIVE_GREETING_TEXT, loadLiveGreeting } from './live-greeting';
 
 jest.mock('ws', () => {
   const events =
@@ -74,6 +75,7 @@ describe('AriService phone startup', () => {
     setRemoteEndpoint: jest.Mock;
     sendUlawToCall: jest.Mock;
     flushQueue: jest.Mock;
+    isOutputQueueDrained: jest.Mock;
   };
   beforeEach(() => {
     sockets.instances = [];
@@ -103,6 +105,7 @@ describe('AriService phone startup', () => {
       setRemoteEndpoint: jest.fn(),
       sendUlawToCall: jest.fn(),
       flushQueue: jest.fn(),
+      isOutputQueueDrained: jest.fn().mockReturnValue(false),
     };
     finalizeExternalSession = jest.fn().mockResolvedValue(undefined);
     appendExternalTranscript = jest.fn();
@@ -147,6 +150,162 @@ describe('AriService phone startup', () => {
     return bridge;
   }
 
+  async function stopWithFakeTimers() {
+    const cleanup = api.handleChannelCleanup({ channel: { id: 'phone' } });
+    await jest.advanceTimersByTimeAsync(2_000);
+    await cleanup;
+    expect(jest.getTimerCount()).toBe(0);
+    jest.useRealTimers();
+  }
+
+  it('plays without any caller packets, records completion once and does not invite a second introduction', async () => {
+    jest.useFakeTimers();
+    try {
+      await api.handleStasisStart({ channel: { id: 'phone' } });
+      const ws = ready();
+      expect(rtp.sendUlawToCall).toHaveBeenCalledTimes(1);
+      await jest.advanceTimersByTimeAsync(200);
+      const audio = ws.send.mock.calls
+        .map(([raw]) => JSON.parse(raw))
+        .filter((event) => event.type === 'session.input_audio.append');
+      expect(audio).toHaveLength(10);
+      expect(
+        audio.every((event) =>
+          Buffer.from(event.audio, 'base64').equals(Buffer.alloc(160, 255)),
+        ),
+      ).toBe(true);
+      expect(appendExternalTranscript).not.toHaveBeenCalled();
+      rtp.isOutputQueueDrained.mockReturnValue(true);
+      await jest.advanceTimersByTimeAsync(100);
+      expect(appendExternalTranscript).toHaveBeenCalledTimes(1);
+      expect(appendExternalTranscript).toHaveBeenCalledWith(
+        'phone',
+        'assistant',
+        LIVE_GREETING_TEXT,
+      );
+      const context = ws.send.mock.calls
+        .map(([raw]) => JSON.parse(raw))
+        .filter((event) => event.type === 'session.instructions.append');
+      expect(context).toHaveLength(1);
+      expect(context[0].content).toContain('Do not repeat the greeting');
+      ws.emit(
+        'message',
+        Buffer.from('{"type":"session.output_audio.delta","delta":"AQID"}'),
+      );
+      expect(rtp.sendUlawToCall).toHaveBeenCalledTimes(1);
+    } finally {
+      await stopWithFakeTimers();
+    }
+  });
+
+  it('stops the greeting on caller speech and delivers their complete audio to GPT Live', async () => {
+    jest.useFakeTimers();
+    try {
+      await api.handleStasisStart({ channel: { id: 'phone' } });
+      const ws = ready();
+      const caller = Buffer.alloc(960, 0);
+      api.handleInboundRtpFrame('phone', caller);
+      await jest.advanceTimersByTimeAsync(60);
+      expect(rtp.flushQueue).not.toHaveBeenCalled();
+      await jest.advanceTimersByTimeAsync(60);
+      expect(rtp.flushQueue).toHaveBeenCalledTimes(1);
+      const input = ws.send.mock.calls
+        .map(([raw]) => JSON.parse(raw))
+        .filter((event) => event.type === 'session.input_audio.append');
+      expect(
+        Buffer.concat(input.map((event) => Buffer.from(event.audio, 'base64'))),
+      ).toEqual(caller);
+      ws.emit(
+        'message',
+        Buffer.from('{"type":"session.output_audio.delta","delta":"AQID"}'),
+      );
+      expect(rtp.sendUlawToCall).toHaveBeenLastCalledWith(
+        'phone',
+        Buffer.from([1, 2, 3]),
+      );
+      expect(appendExternalTranscript).not.toHaveBeenCalledWith(
+        'phone',
+        'assistant',
+        LIVE_GREETING_TEXT,
+      );
+    } finally {
+      await stopWithFakeTimers();
+    }
+  });
+
+  it('also interrupts for quiet callers identified by the provider transcript', async () => {
+    jest.useFakeTimers();
+    try {
+      await api.handleStasisStart({ channel: { id: 'phone' } });
+      const ws = ready();
+      ws.emit(
+        'message',
+        Buffer.from(
+          '{"type":"session.input_transcript.delta","delta":"Hello"}',
+        ),
+      );
+      expect(rtp.flushQueue).toHaveBeenCalled();
+      expect(appendExternalTranscript).toHaveBeenCalledWith(
+        'phone',
+        'user',
+        'Hello',
+      );
+      const context = ws.send.mock.calls
+        .map(([raw]) => JSON.parse(raw))
+        .filter((event) => event.type === 'session.instructions.append');
+      expect(context[0].content).toContain('greeting was interrupted');
+    } finally {
+      await stopWithFakeTimers();
+    }
+  });
+
+  it('sends a final queued speech frame before starting the hangup transcript grace period', async () => {
+    jest.useFakeTimers();
+    try {
+      await api.handleStasisStart({ channel: { id: 'phone' } });
+      const ws = ready();
+      api.handleInboundRtpFrame('phone', Buffer.alloc(160, 75));
+      const cleanup = api.handleChannelCleanup({ channel: { id: 'phone' } });
+      await jest.advanceTimersByTimeAsync(20);
+      const input = ws.send.mock.calls
+        .map(([raw]) => JSON.parse(raw))
+        .find((event) => event.type === 'session.input_audio.append');
+      expect(Buffer.from(input.audio, 'base64')).toEqual(Buffer.alloc(160, 75));
+      await jest.advanceTimersByTimeAsync(700);
+      ws.emit(
+        'message',
+        Buffer.from(
+          '{"type":"session.input_transcript.delta","delta":"My last words"}',
+        ),
+      );
+      expect(finalizeExternalSession).not.toHaveBeenCalled();
+      await jest.advanceTimersByTimeAsync(50);
+      await cleanup;
+      expect(appendExternalTranscript).toHaveBeenCalledWith(
+        'phone',
+        'user',
+        'My last words',
+      );
+    } finally {
+      await stopWithFakeTimers();
+    }
+  });
+
+  it('closes a blocked GPT input socket and cancels its input clock', async () => {
+    jest.useFakeTimers();
+    try {
+      await api.handleStasisStart({ channel: { id: 'phone' } });
+      const ws = ready();
+      (ws as Socket & { bufferedAmount: number }).bufferedAmount = 20_000;
+      await jest.advanceTimersByTimeAsync(1_000);
+      expect(ws.close).toHaveBeenCalled();
+      expect(api.aiSessions.size).toBe(0);
+      expect(rtp.unregisterCallSession).toHaveBeenCalled();
+    } finally {
+      await stopWithFakeTimers();
+    }
+  });
+
   it('starts GPT after answer while bridge creation is still pending', async () => {
     const bridge = blockBridge();
     const startup = api.handleStasisStart({ channel: { id: 'phone' } });
@@ -159,7 +318,8 @@ describe('AriService phone startup', () => {
     }
   });
 
-  it('seeds the legacy greeting at startup and preserves caller audio until session and media are ready', async () => {
+  it('plays the saved greeting once after both connections are ready and paces startup input', async () => {
+    jest.useFakeTimers();
     const bridge = blockBridge();
     const startup = api.handleStasisStart({ channel: { id: 'phone' } });
     await settle();
@@ -170,6 +330,12 @@ describe('AriService phone startup', () => {
       expect(ws.send).toHaveBeenCalledTimes(1); // session.start only
       bridge.resolve({ data: {} });
       await startup;
+      expect(rtp.sendUlawToCall).toHaveBeenCalledWith(
+        'phone',
+        loadLiveGreeting('quartz'),
+      );
+      expect(ws.send).toHaveBeenCalledTimes(1);
+      await jest.advanceTimersByTimeAsync(20);
       const events = ws.send.mock.calls.map(
         (args: [string]) =>
           JSON.parse(args[0]) as { type: string; audio?: string },
@@ -180,8 +346,10 @@ describe('AriService phone startup', () => {
       ]);
       expect(
         JSON.parse(ws.send.mock.calls[0][0]).session.input[0].content[0].text,
-      ).toContain('greet the caller');
-      expect(events[1].audio).toBe(Buffer.from([1, 2, 3]).toString('base64'));
+      ).toContain('Remain silent until the caller speaks');
+      expect(Buffer.from(events[1].audio!, 'base64').subarray(0, 3)).toEqual(
+        Buffer.from([1, 2, 3]),
+      );
       expect(rtp.setRemoteEndpoint).toHaveBeenCalledWith(
         'phone',
         '127.0.0.1',
@@ -189,13 +357,18 @@ describe('AriService phone startup', () => {
       );
       ws.emit('message', Buffer.from('{"type":"session.started"}'));
       expect(ws.send).toHaveBeenCalledTimes(2);
+      expect(rtp.sendUlawToCall).toHaveBeenCalledTimes(1);
     } finally {
       bridge.resolve({ data: {} });
       await startup;
+      const cleanup = api.handleChannelCleanup({ channel: { id: 'phone' } });
+      await jest.advanceTimersByTimeAsync(750);
+      await cleanup;
+      jest.useRealTimers();
     }
   });
 
-  it('buffers unexpected GPT audio until the RTP destination and bridge are ready', async () => {
+  it('discards model-generated introductions so they cannot duplicate the saved greeting', async () => {
     const bridge = blockBridge();
     const startup = api.handleStasisStart({ channel: { id: 'phone' } });
     await settle();
@@ -208,9 +381,10 @@ describe('AriService phone startup', () => {
       expect(rtp.sendUlawToCall).not.toHaveBeenCalled();
       bridge.resolve({ data: {} });
       await startup;
+      expect(rtp.sendUlawToCall).toHaveBeenCalledTimes(1);
       expect(rtp.sendUlawToCall).toHaveBeenCalledWith(
         'phone',
-        Buffer.from([1, 2, 3]),
+        loadLiveGreeting('quartz'),
       );
     } finally {
       bridge.resolve({ data: {} });
@@ -281,6 +455,7 @@ describe('AriService phone startup', () => {
     try {
       await api.handleStasisStart({ channel: { id: 'phone' } });
       const ws = ready();
+      rtp.sendUlawToCall.mockClear();
       finalizeExternalSession.mockReturnValue(saved.promise);
       const cleanup = api.handleChannelCleanup({ channel: { id: 'phone' } });
       const duplicate = api.handleChannelCleanup({ channel: { id: 'phone' } });
@@ -450,6 +625,7 @@ describe('AriService phone startup', () => {
   });
 
   it('does not send caller audio on WebSocket open before session.started', async () => {
+    jest.useFakeTimers();
     await api.handleStasisStart({ channel: { id: 'phone' } });
     const ws = sockets.instances[0];
     ws.readyState = 1;
@@ -457,7 +633,12 @@ describe('AriService phone startup', () => {
     api.handleInboundRtpFrame('phone', Buffer.from([1, 2, 3]));
     expect(ws.send).toHaveBeenCalledTimes(1);
     ws.emit('message', Buffer.from('{"type":"session.started"}'));
+    await jest.advanceTimersByTimeAsync(20);
     expect(ws.send).toHaveBeenCalledTimes(2);
+    const cleanup = api.handleChannelCleanup({ channel: { id: 'phone' } });
+    await jest.advanceTimersByTimeAsync(750);
+    await cleanup;
+    jest.useRealTimers();
   });
 
   it('cleans up a GPT session that never becomes ready', async () => {

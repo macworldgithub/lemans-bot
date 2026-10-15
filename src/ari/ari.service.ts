@@ -14,6 +14,8 @@ import { VoiceService } from '../voice/voice.service';
 import { AriRtpMediaService } from './ari-rtp-media.service';
 import { AriWebSocketGateway } from './ari-websocket.gateway';
 import { PHONE_STARTUP_AUDIO_SECONDS } from '../voice/sandwich.service';
+import { LivePhoneInput } from './live-phone-input';
+import { LIVE_GREETING_TEXT, loadLiveGreeting } from './live-greeting';
 
 type AriEvent = {
   type?: string;
@@ -72,6 +74,10 @@ type AiSession = {
   pendingOutput: Buffer[];
   pendingOutputBytes: number;
   startupTimer: ReturnType<typeof setTimeout> | null;
+  inputStream?: LivePhoneInput;
+  greetingAudio: Buffer;
+  greetingState?: 'playing' | 'finished' | 'interrupted';
+  callerSpoken?: boolean;
 };
 
 type PendingAriCleanup = { kind: 'channel' | 'bridge'; id: string };
@@ -609,16 +615,78 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
   }
 
   private forwardPhoneAudio(callId: string, ai: AiSession, payload: Buffer) {
+    ai.inputStream?.enqueue(payload);
+  }
+
+  private sendLivePhoneFrame(callId: string, ai: AiSession, payload: Buffer) {
+    const call = this.sessions.get(callId);
+    if (!call || (call.ended && !ai.draining) || ai.closed) return;
     try {
+      if (ai.ws.bufferedAmount > 16_000) {
+        ai.inputStream?.close();
+        this.failPhoneCall(callId, 'GPT_INPUT_BACKPRESSURE');
+        return;
+      }
       ai.ws.send(
         JSON.stringify({
           type: 'session.input_audio.append',
           audio: payload.toString('base64'),
         }),
       );
-      CallLatency.mark(callId, 'T13', 'First caller audio forwarded to AI');
+      CallLatency.mark(callId, 'T13', 'First audio frame forwarded to AI');
+      if (
+        !ai.draining &&
+        ai.greetingState === 'playing' &&
+        this.ariRtpMediaService.isOutputQueueDrained(callId)
+      )
+        this.finishLiveGreeting(callId, ai, false);
     } catch {
+      ai.inputStream?.close();
       this.failPhoneCall(callId, 'INPUT_SEND_FAILED');
+    }
+  }
+
+  private finishLiveGreeting(
+    callId: string,
+    ai: AiSession,
+    interrupted: boolean,
+  ) {
+    if (ai.greetingState !== 'playing') return;
+    ai.greetingState = interrupted ? 'interrupted' : 'finished';
+    if (interrupted) {
+      this.ariRtpMediaService.flushQueue(callId);
+      if (ai.processingAudio) this.ariWebSocketGateway.flushCallAudio(callId);
+    }
+    // Context describes application playback; it must not ask GPT to greet again.
+    ai.ws.send(
+      JSON.stringify({
+        type: 'session.instructions.append',
+        delegation_id: null,
+        content: interrupted
+          ? 'The application greeting was interrupted by the caller. Listen and answer their request. Do not restart the greeting or introduce yourself again.'
+          : `The application has delivered this greeting: "${LIVE_GREETING_TEXT}". Wait for the caller and answer their request. Do not repeat the greeting or introduce yourself again.`,
+      }),
+    );
+    if (!interrupted)
+      this.voiceService.appendExternalTranscript(
+        callId,
+        'assistant',
+        LIVE_GREETING_TEXT,
+      );
+    CallLatency.event(
+      callId,
+      interrupted ? 'GREETING_INTERRUPTED' : 'GREETING_FINISHED',
+      {},
+    );
+  }
+
+  private liveCallerStarted(callId: string, ai: AiSession) {
+    if (ai.closed || this.sessions.get(callId)?.ended) return;
+    ai.callerSpoken = true;
+    try {
+      this.finishLiveGreeting(callId, ai, true);
+    } catch {
+      this.failPhoneCall(callId, 'GREETING_CONTEXT_SEND_FAILED');
     }
   }
 
@@ -662,6 +730,12 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
     )
       return;
     try {
+      if (!ai.greetingState) {
+        ai.greetingState = 'playing';
+        CallLatency.mark(callId, 'GREETING', 'Saved GPT Live greeting queued');
+        CallLatency.mark(callId, 'T14', 'Saved GPT Live greeting audio ready');
+        this.ariRtpMediaService.sendUlawToCall(callId, ai.greetingAudio);
+      }
       // Preserve ordered startup speech; no input is sent before session.started.
       for (const audio of ai.pendingInput) {
         if (call.ended) break;
@@ -669,6 +743,7 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
       }
       ai.pendingInput = [];
       ai.pendingInputBytes = 0;
+      ai.inputStream!.start();
       for (const audio of ai.pendingOutput) {
         if (call.ended) break;
         this.ariRtpMediaService.sendUlawToCall(callId, audio);
@@ -726,15 +801,7 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
       // Convert slin (16-bit PCM) to ulaw for OpenAI Realtime API
       const ulawBuffer = this.convertSlinToUlaw(audioBuffer);
 
-      if (aiSession.ws.readyState === WebSocket.OPEN) {
-        aiSession.ws.send(
-          JSON.stringify({
-            type: 'session.input_audio.append',
-            audio: ulawBuffer.toString('base64'),
-          }),
-        );
-        CallLatency.mark(callId, 'T13', 'First caller audio forwarded to AI');
-      }
+      this.handleLiveWebSocketInput(callId, aiSession, ulawBuffer);
     } catch (error) {
       this.logger.error(
         `Failed to process WebSocket audio for call=${callId}: ${(error as Error).message}`,
@@ -743,6 +810,23 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
 
     // Return null - AI responses will be handled via the existing WebSocket event handlers
     return null;
+  }
+
+  private handleLiveWebSocketInput(
+    callId: string,
+    ai: AiSession,
+    audio: Buffer,
+  ) {
+    const call = this.sessions.get(callId);
+    if (!call || call.ended) return;
+    if (!ai.ready || !call.mediaReady) {
+      if (ai.pendingInputBytes + audio.length > this.maxStartupAudioBytes) {
+        this.failPhoneCall(callId, 'INPUT_BUFFER_LIMIT');
+        return;
+      }
+      ai.pendingInput.push(Buffer.from(audio));
+      ai.pendingInputBytes += audio.length;
+    } else this.forwardPhoneAudio(callId, ai, audio);
   }
 
   /**
@@ -889,6 +973,9 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
     if (this.aiSessions.has(callId)) return;
     const apiKey = this.configService.get<string>('OPENAI_API_KEY');
     if (!apiKey) throw new Error('OPENAI_API_KEY missing');
+    const voice =
+      this.configService.get<string>('OPENAI_LIVE_VOICE') ?? 'quartz';
+    const greetingAudio = loadLiveGreeting(voice);
     CallLatency.mark(callId, 'T8', 'AI WebSocket connection starts');
     const ws = new WebSocket('wss://api.openai.com/v1/live/sessions', {
       headers: { Authorization: 'Bearer ' + apiKey },
@@ -908,7 +995,13 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
         () => this.failPhoneCall(callId, 'GPT_STARTUP_TIMEOUT'),
         15_000,
       ),
+      greetingAudio,
     };
+    ai.inputStream = new LivePhoneInput(
+      (audio) => this.sendLivePhoneFrame(callId, ai, audio),
+      () => this.liveCallerStarted(callId, ai),
+      () => this.failPhoneCall(callId, 'INPUT_BUFFER_LIMIT'),
+    );
     ai.startupTimer?.unref();
     this.aiSessions.set(callId, ai);
     ws.on('open', () => {
@@ -920,13 +1013,13 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
         return;
       CallLatency.mark(callId, 'T9', 'AI WebSocket connected');
       try {
-        // Preserve the working Live protocol, prompt, voice and delegation settings.
+        // The application plays the saved opening. GPT Live starts by listening.
         ws.send(
           JSON.stringify({
             type: 'session.start',
             session: {
               model: 'gpt-live-1',
-              instructions,
+              instructions: `${instructions}\n\nThe application plays Chloe's saved opening greeting. Do not generate an opening greeting or introduce yourself. Listen first, then respond to the caller. Never repeat the application greeting.`,
               input: [
                 {
                   type: 'message',
@@ -934,7 +1027,7 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
                   content: [
                     {
                       type: 'input_text',
-                      text: 'As soon as the phone call is connected, greet the caller in English as Chloe from LeMans Entertainment. Welcome them warmly, introduce yourself, and ask how you can help. Start speaking immediately; do not wait for the caller to say hello or for a silence timeout. Then pause and listen. Keep your delivery warm, clear, and conversational.',
+                      text: 'The application will play the opening greeting through the telephone audio connection. Remain silent until the caller speaks. Respond to their request without another greeting or introduction.',
                     },
                   ],
                 },
@@ -942,19 +1035,12 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
               audio: {
                 format: { type: 'audio/pcmu', rate: 8000 },
                 output: {
-                  voice:
-                    this.configService.get<string>('OPENAI_LIVE_VOICE') ??
-                    'quartz',
+                  voice,
                 },
               },
               delegation: { type: 'client' },
             },
           }),
-        );
-        CallLatency.mark(
-          callId,
-          'GREETING',
-          'Opening greeting seeded at session startup',
         );
         CallLatency.mark(callId, 'T10', 'AI session configuration sent');
         CallLatency.event(callId, 'VAD_CONFIG', {
@@ -978,8 +1064,12 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
       if (!ai.closed && this.aiSessions.get(callId) === ai)
         this.handleAiRealtimeEvent(callId, data.toString());
     });
-    ws.on('error', () => this.failPhoneCall(callId, 'GPT_WEBSOCKET_ERROR'));
+    ws.on('error', () => {
+      ai.inputStream?.close();
+      this.failPhoneCall(callId, 'GPT_WEBSOCKET_ERROR');
+    });
     ws.on('close', () => {
+      ai.inputStream?.close();
       if (!ai.closed && this.aiSessions.get(callId) === ai)
         this.failPhoneCall(callId, 'GPT_WEBSOCKET_CLOSED');
     });
@@ -1023,6 +1113,7 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
           this.activatePhoneAudio(callId);
           break;
         case 'session.input_transcript.delta':
+          if (event.delta?.trim()) this.liveCallerStarted(callId, ai);
           this.handleBargeIn(callId);
           call.callerTranscript =
             (call.callerTranscript || '') + (event.delta ?? '');
@@ -1034,6 +1125,7 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
           this.scheduleFarewellHangup(callId, call);
           break;
         case 'session.output_transcript.delta':
+          if (!ai.callerSpoken) break;
           this.voiceService.appendExternalTranscript(
             callId,
             'assistant',
@@ -1080,6 +1172,8 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
         }
         case 'session.output_audio.delta': {
           if (!event.delta) return;
+          // Model output is never allowed to overlap/repeat the saved opening.
+          if (!ai.callerSpoken) return;
           if (call.farewellTimer || call.hangupAfterFarewell) {
             call.farewellAssistantAudioSeen = true;
           }
@@ -1272,6 +1366,13 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
     const ai = this.aiSessions.get(callId);
     if (ai?.ready && !ai.closed && ai.ws.readyState === WebSocket.OPEN) {
       ai.draining = true;
+      // Send the final queued caller frames before waiting for their transcript.
+      // The input queue is bounded to ten seconds; normal calls retain <20ms.
+      await ai.inputStream?.drain();
+      if (ai.closed || ai.ws.readyState !== WebSocket.OPEN) {
+        this.cleanupAiSession(callId);
+        return;
+      }
       // Bound the wait so a silent or broken provider cannot block finalization.
       await new Promise<void>((resolve) => {
         const finish = () => {
@@ -1295,6 +1396,7 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
     }
 
     aiSession.closed = true;
+    aiSession.inputStream?.close();
     if (aiSession.startupTimer) clearTimeout(aiSession.startupTimer);
     aiSession.startupTimer = null;
     aiSession.pendingInput = [];

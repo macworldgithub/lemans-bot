@@ -58,7 +58,7 @@ DEEPGRAM_EOT_TIMEOUT_MS=1500
 
 The existing `DeepGram_API_Key` spelling is supported when the canonical `DEEPGRAM_API_KEY` is absent or empty. Your current keys and ElevenLabs voice ID can be used as supplied. Provider keys stay in server-side WebSocket headers/API clients and are never sent to the browser or included in latency logs. Existing PBX, MongoDB, SMTP and CRM environment variables continue to apply.
 
-`VOICE_ARCHITECTURE=gpt-live` explicitly restores the previous GPT-Live path for both web and phone calls. Leaving this setting absent enables Sandwich. Restart the backend after configuration changes.
+`VOICE_ARCHITECTURE=gpt-live` selects GPT Live for both web and phone calls. Its phone path now plays a saved GPT Live greeting before the conversation; see [saved greeting deployment](gpt-live-saved-greeting.md). Leaving this setting absent enables Sandwich. Restart the backend after configuration changes.
 
 ## Verification completed
 

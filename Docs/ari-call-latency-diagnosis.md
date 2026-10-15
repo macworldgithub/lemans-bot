@@ -1,5 +1,10 @@
 # Production phone-call startup optimization
 
+Historical startup investigation: the GPT Live phone opening has since moved to
+a saved recording with continuous paced input. For current greeting behavior,
+deployment assets and tests, see [GPT Live saved greeting](gpt-live-saved-greeting.md).
+The greeting-trigger description below records the earlier implementation.
+
 Scope: DID -> SIP provider -> 3CX -> 8888 -> Asterisk -> Stasis(lemans-bot) -> AriService -> GPT-Live -> RTP -> caller. No VoiceGateway, VoiceService, browser/frontend testing, telephony configuration, ports, NAT or firewall changes.
 
 ## 1. Measured bottleneck
