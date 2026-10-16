@@ -139,6 +139,51 @@ describe('VoiceService lead lifecycle', () => {
     );
   });
 
+  it('does not stop browser audio when delayed caller captions overlap streamed speech', async () => {
+    const ws = await connect();
+    service.triggerGreeting('browser');
+    for (const delta of ['I need', ' a booking']) {
+      ws.emit(
+        'message',
+        Buffer.from(
+          JSON.stringify({
+            type: 'session.output_audio.delta',
+            delta: 'AQIDBA==',
+          }),
+        ),
+      );
+      ws.emit(
+        'message',
+        Buffer.from(
+          JSON.stringify({
+            type: 'session.input_transcript.delta',
+            delta,
+            start_ms: 100,
+            end_ms: 300,
+          }),
+        ),
+      );
+    }
+
+    expect(events).not.toHaveBeenCalledWith({ type: 'speech-started' });
+    expect(
+      events.mock.calls.filter(([event]) => event.type === 'audio-delta'),
+    ).toHaveLength(2);
+    expect(capture.appendTranscript).toHaveBeenCalledWith(
+      'browser',
+      'user',
+      ' a booking',
+      100,
+      300,
+    );
+    await jest.advanceTimersByTimeAsync(350);
+    expect(events).toHaveBeenCalledWith({ type: 'audio-done' });
+
+    const closing = service.closeSession('browser', false);
+    await jest.advanceTimersByTimeAsync(0);
+    await closing;
+  });
+
   it('drains final transcripts and emits session-closed only after final persistence', async () => {
     const ws = await connect();
     service.triggerGreeting('browser');

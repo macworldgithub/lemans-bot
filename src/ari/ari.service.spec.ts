@@ -244,7 +244,7 @@ describe('AriService phone startup', () => {
           '{"type":"session.input_transcript.delta","delta":"Hello"}',
         ),
       );
-      expect(rtp.flushQueue).toHaveBeenCalled();
+      expect(rtp.flushQueue).toHaveBeenCalledTimes(1);
       expect(appendExternalTranscript).toHaveBeenCalledWith(
         'phone',
         'user',
@@ -254,6 +254,63 @@ describe('AriService phone startup', () => {
         .map(([raw]) => JSON.parse(raw))
         .filter((event) => event.type === 'session.instructions.append');
       expect(context[0].content).toContain('greeting was interrupted');
+      ws.emit(
+        'message',
+        Buffer.from('{"type":"session.output_audio.delta","delta":"AQID"}'),
+      );
+      ws.emit(
+        'message',
+        Buffer.from(
+          '{"type":"session.input_transcript.delta","delta":" there"}',
+        ),
+      );
+      expect(rtp.flushQueue).toHaveBeenCalledTimes(1);
+    } finally {
+      await stopWithFakeTimers();
+    }
+  });
+
+  it('preserves phone audio when caller caption fragments arrive after the saved greeting', async () => {
+    jest.useFakeTimers();
+    try {
+      await api.handleStasisStart({ channel: { id: 'phone' } });
+      const ws = ready();
+      rtp.isOutputQueueDrained.mockReturnValue(true);
+      await jest.advanceTimersByTimeAsync(20);
+      rtp.sendUlawToCall.mockClear();
+
+      for (const delta of ['I need', ' a booking']) {
+        ws.emit(
+          'message',
+          Buffer.from(
+            JSON.stringify({
+              type: 'session.input_transcript.delta',
+              delta,
+            }),
+          ),
+        );
+        ws.emit(
+          'message',
+          Buffer.from(
+            JSON.stringify({
+              type: 'session.output_audio.delta',
+              delta: 'AQID',
+            }),
+          ),
+        );
+      }
+
+      expect(rtp.flushQueue).not.toHaveBeenCalled();
+      expect(rtp.sendUlawToCall).toHaveBeenCalledTimes(2);
+      expect(rtp.sendUlawToCall).toHaveBeenLastCalledWith(
+        'phone',
+        Buffer.from([1, 2, 3]),
+      );
+      expect(appendExternalTranscript).toHaveBeenCalledWith(
+        'phone',
+        'user',
+        ' a booking',
+      );
     } finally {
       await stopWithFakeTimers();
     }

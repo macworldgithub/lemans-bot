@@ -101,6 +101,63 @@ describe('AriRtpMediaService phone readiness', () => {
     CallLatency.end('phone');
   });
 
+  it('preserves ten seconds of streamed speech without shortening it or inserting silence', () => {
+    jest.useFakeTimers();
+    let now = 0;
+    jest.spyOn(performance, 'now').mockImplementation(() => now);
+    const packets: { data: Buffer; at: number }[] = [];
+    const send = jest.fn(
+      (
+        data: Buffer,
+        _port: number,
+        _host: string,
+        done: (error: Error | null) => void,
+      ) => {
+        packets.push({ data: Buffer.from(data), at: now });
+        done(null);
+      },
+    );
+    api.socket = { send, close: jest.fn() } as unknown as Socket;
+    service.registerCallSession('phone', true);
+    service.setRemoteEndpoint('phone', '127.0.0.1', 18000);
+    // 100ms provider chunks arrive at their actual playback rate. None of these
+    // samples is mu-law silence, so artificial gaps cannot match the input.
+    const original = Buffer.from(
+      Array.from({ length: 80_000 }, (_, index) => index % 254),
+    );
+    let offset = 0;
+    for (let tick = 0; tick < 500; tick++) {
+      if (tick % 5 === 0) {
+        service.sendUlawToCall(
+          'phone',
+          original.subarray(offset, offset + 800),
+        );
+        offset += 800;
+      }
+      now += 20;
+      jest.advanceTimersByTime(20);
+    }
+    expect(packets).toHaveLength(500);
+    const played = Buffer.concat(packets.map(({ data }) => data.subarray(12)));
+    expect(played.length).toBe(original.length);
+    expect(played.equals(original)).toBe(true);
+    expect(service.isOutputQueueDrained('phone')).toBe(true);
+    for (let index = 0; index < packets.length; index++) {
+      expect(packets[index].at).toBe((index + 1) * 20);
+      expect(packets[index].data.length).toBe(172);
+      if (index > 0) {
+        expect(packets[index].data.readUInt16BE(2)).toBe(
+          (packets[index - 1].data.readUInt16BE(2) + 1) & 0xffff,
+        );
+        expect(packets[index].data.readUInt32BE(4)).toBe(
+          (packets[index - 1].data.readUInt32BE(4) + 160) >>> 0,
+        );
+      }
+    }
+    service.unregisterCallSession('phone');
+    expect(jest.getTimerCount()).toBe(0);
+  });
+
   it('clears unaffiliated startup packets when the waiting call disconnects', () => {
     service.registerCallSession('phone', true);
     api.handleIncomingPacket(packet(1), remote(18000));

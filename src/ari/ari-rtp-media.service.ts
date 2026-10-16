@@ -32,18 +32,13 @@ type RtpSession = {
   txLastAudioAt?: number;
   txIdleSince?: number;
   txAudioStarted?: boolean;
-  speedCarry?: Buffer;
-  speedNextPosition?: number;
 };
-
-// GPT-Live does not expose a numeric output-speed setting. Shorten the
-// telephony audio stream by 5% to make the spoken pace measurably quicker.
-const PHONE_SPEECH_SPEED = 1.05;
 
 // G.711 µ-law RTP is 8 kHz: 160 samples make one standard 20 ms packet.
 const RTP_SAMPLE_RATE_HZ = 8_000;
 const RTP_PACKET_DURATION_MS = 20;
-const RTP_PACKET_SAMPLES = (RTP_SAMPLE_RATE_HZ * RTP_PACKET_DURATION_MS) / 1_000;
+const RTP_PACKET_SAMPLES =
+  (RTP_SAMPLE_RATE_HZ * RTP_PACKET_DURATION_MS) / 1_000;
 const RTP_PREBUFFER_PACKETS = 2;
 const RTP_PREBUFFER_TIMEOUT_MS = 60;
 const RTP_PARTIAL_PACKET_TIMEOUT_MS = 60;
@@ -198,14 +193,15 @@ export class AriRtpMediaService implements OnModuleInit, OnModuleDestroy {
       return;
     }
 
-    const fasterPayload = this.speedUpUlawAudio(session, ulawPayload);
-    if (!fasterPayload.length) return;
+    if (!ulawPayload.length) return;
 
     // Append to the session's output queue; the drain timer sends at steady 20ms pace
     if (!session.txQueue) {
       session.txQueue = Buffer.alloc(0);
     }
-    session.txQueue = Buffer.concat([session.txQueue, fasterPayload]);
+    // Preserve the provider's samples and duration. Shortening streamed chunks
+    // can exhaust the queue before the next chunk arrives and introduce gaps.
+    session.txQueue = Buffer.concat([session.txQueue, ulawPayload]);
     session.txLastAudioAt = performance.now();
     session.txIdleSince = undefined;
     CallLatency.mark(callId, 'OUTPUT_QUEUED', 'First AI audio queued for RTP');
@@ -223,8 +219,6 @@ export class AriRtpMediaService implements OnModuleInit, OnModuleDestroy {
     const session = this.sessions.get(callId);
     if (!session) return;
     session.txQueue = Buffer.alloc(0);
-    session.speedCarry = Buffer.alloc(0);
-    session.speedNextPosition = 0;
     session.txLastAudioAt = undefined;
   }
 
@@ -323,57 +317,6 @@ export class AriRtpMediaService implements OnModuleInit, OnModuleDestroy {
     session.txNextPacketAt =
       now >= nextAt ? now + RTP_PACKET_DURATION_MS : nextAt;
     this.scheduleDrainTick(session);
-  }
-
-  private speedUpUlawAudio(session: RtpSession, payload: Buffer): Buffer {
-    const source = Buffer.concat([session.speedCarry ?? Buffer.alloc(0), payload]);
-    let position = session.speedNextPosition ?? 0;
-    const output: number[] = [];
-
-    // Resample continuously across provider chunks to avoid a phase jump at
-    // each streaming audio boundary. This intentionally raises pitch slightly.
-    while (position + 1 < source.length) {
-      const leftIndex = Math.floor(position);
-      const fraction = position - leftIndex;
-      const left = this.ulawToLinear(source[leftIndex]);
-      const right = this.ulawToLinear(source[leftIndex + 1]);
-      output.push(
-        this.linearToUlaw(Math.round(left + (right - left) * fraction)),
-      );
-      position += PHONE_SPEECH_SPEED;
-    }
-
-    const consumed = Math.floor(position);
-    session.speedCarry = source.subarray(consumed);
-    session.speedNextPosition = position - consumed;
-    return Buffer.from(output);
-  }
-
-  private ulawToLinear(value: number): number {
-    const decoded = (~value) & 0xff;
-    const sign = decoded & 0x80;
-    const exponent = (decoded >> 4) & 0x07;
-    const mantissa = decoded & 0x0f;
-    let sample = ((mantissa << 3) + 0x84) << exponent;
-    sample -= 0x84;
-    return sign ? -sample : sample;
-  }
-
-  private linearToUlaw(sample: number): number {
-    const BIAS = 0x84;
-    const CLIP = 32635;
-    const clipped = Math.max(-CLIP, Math.min(CLIP, sample));
-    const sign = clipped < 0 ? 0x80 : 0;
-    const magnitude = Math.abs(clipped) + BIAS;
-
-    let exponent = 7;
-    let mask = 0x4000;
-    while (exponent > 0 && (magnitude & mask) === 0) {
-      exponent -= 1;
-      mask >>= 1;
-    }
-    const mantissa = (magnitude >> (exponent + 3)) & 0x0f;
-    return (~(sign | (exponent << 4) | mantissa)) & 0xff;
   }
 
   private startSocket() {

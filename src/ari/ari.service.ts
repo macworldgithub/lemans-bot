@@ -1113,8 +1113,10 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
           this.activatePhoneAudio(callId);
           break;
         case 'session.input_transcript.delta':
-          if (event.delta?.trim()) this.liveCallerStarted(callId, ai);
-          this.handleBargeIn(callId);
+          // Only the saved greeting needs application-owned interruption.
+          // Later captions must not discard GPT Live's ongoing audio stream.
+          if (!ai.callerSpoken && event.delta?.trim())
+            this.liveCallerStarted(callId, ai);
           call.callerTranscript =
             (call.callerTranscript || '') + (event.delta ?? '');
           this.voiceService.appendExternalTranscript(
@@ -1232,16 +1234,6 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
     } catch {
       this.failPhoneCall(callId, 'GPT_EVENT_PROCESSING_FAILED');
     }
-  }
-
-  private handleBargeIn(callId: string) {
-    const aiSession = this.aiSessions.get(callId);
-    if (!aiSession || aiSession.ws.readyState !== WebSocket.OPEN) {
-      return;
-    }
-
-    // GPT-Live handles turn-taking; discard audio already queued for telephony.
-    this.ariRtpMediaService.flushQueue(callId);
   }
 
   private forwardSandwichPhoneInput(

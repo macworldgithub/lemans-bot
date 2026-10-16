@@ -440,11 +440,8 @@ export class VoiceService implements OnModuleDestroy {
           clearTimeout(session.silenceTimer);
           session.silenceTimer = null;
         }
-        if (session.outputAudioTimer) {
-          clearTimeout(session.outputAudioTimer);
-          session.outputAudioTimer = null;
-          session.onEvent({ type: 'speech-started' });
-        }
+        // Captions can arrive late during model speech. GPT Live manages
+        // interruptions through the audio stream; captions must not stop playback.
         session.onEvent({ type: 'user-transcript-delta', delta: event.delta });
         break;
       case 'session.instructions.appended':

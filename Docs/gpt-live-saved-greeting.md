@@ -14,8 +14,10 @@ with `gpt-live-1`, voice `quartz`. The telephone version is
 `chloe-greeting.ulaw`, raw mono G.711 mu-law at 8 kHz, approximately 4.7 seconds.
 Its JSON metadata records the voice, exact returned transcript and audio hash.
 The loader checks the hash and format, and rejects a voice mismatch rather than
-silently switching voices during the call. The existing RTP speech-speed setting
-applies equally to the recording and subsequent model audio.
+silently switching voices during the call. The recording and subsequent model
+audio both play at their original rate. The former 5% speed conversion was removed
+because it can exhaust the output queue between streamed audio chunks and create
+gaps. RTP still sends one 160-sample packet every 20 ms.
 
 ## Runtime flow
 
@@ -44,6 +46,20 @@ The implementation uses application playback instead of Live audio fixtures:
 fixture playback drops incoming audio while active, which would lose an early
 caller interruption. See the official [session guide](https://developers.openai.com/api/docs/guides/live-conversations)
 and [playback controls](https://developers.openai.com/api/docs/guides/voice-server-controls?api=live).
+
+## Transcript fragments and playback
+
+GPT Live manages when to listen and speak through its continuous audio stream.
+Caller transcript fragments can arrive late or overlap assistant speech, so the
+web handler must not emit `speech-started` from those fragments, and the phone
+handler must not clear queued model audio for each fragment. Keep forwarding
+transcripts for display and lead capture. Only the application-owned saved
+greeting uses the existing first-caller-speech interruption path; it clears that
+greeting once. Already queued model audio still plays in order, so interruption
+latency also depends on the size of the playback queue.
+
+See the official [transcript timing guidance](https://developers.openai.com/api/docs/guides/live-conversations#transcript-deltas)
+and [WebSocket audio handling](https://developers.openai.com/api/docs/guides/voice-websockets?api=live).
 
 ## Build and deploy
 

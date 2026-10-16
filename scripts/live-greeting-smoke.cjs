@@ -45,7 +45,7 @@ const service = new AriService(
     sendUlawToCall(id, audio) {
       if (!callerStarted) greetingCount++;
       else responseBytes += audio.length;
-      queuedUntil = Math.max(Date.now(), queuedUntil) + audio.length / 8 / 1.05;
+      queuedUntil = Math.max(Date.now(), queuedUntil) + audio.length / 8;
     },
     isOutputQueueDrained: () => Date.now() >= queuedUntil,
     flushQueue() {
