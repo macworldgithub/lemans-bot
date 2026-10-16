@@ -81,6 +81,29 @@ describe('VoiceService lead lifecycle', () => {
     );
   });
 
+  it('uses the configured speaking pace in browser generation without changing the audio rate', async () => {
+    service = new VoiceService(
+      {
+        get: (key: string) =>
+          key === 'OPENAI_LIVE_SPEAKING_PACE' ? 'very_fast' : 'test-key',
+      } as unknown as ConfigService,
+      capture as unknown as LeadCaptureService,
+    );
+    const ws = await connect();
+    const start = ws.send.mock.calls
+      .map(([raw]) => JSON.parse(raw))
+      .find((event) => event.type === 'session.start');
+    expect(start.session.instructions).toContain('Speaking pace: very fast.');
+    expect(start.session.audio.format).toEqual({
+      type: 'audio/pcm',
+      rate: 24000,
+    });
+    expect(start.session.audio.output).not.toHaveProperty('speed');
+    const closing = service.closeSession('browser', false);
+    await jest.advanceTimersByTimeAsync(0);
+    await closing;
+  });
+
   it('forwards both speakers and executes later delegations to retain corrections', async () => {
     const ws = await connect();
     service.triggerGreeting('browser');

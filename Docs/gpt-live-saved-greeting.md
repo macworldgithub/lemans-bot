@@ -61,6 +61,26 @@ latency also depends on the size of the playback queue.
 See the official [transcript timing guidance](https://developers.openai.com/api/docs/guides/live-conversations#transcript-deltas)
 and [WebSocket audio handling](https://developers.openai.com/api/docs/guides/voice-websockets?api=live).
 
+## Speaking pace on web and phone
+
+Set `OPENAI_LIVE_SPEAKING_PACE` in `.env` to `slow`, `normal`, `brisk`, `fast`,
+or `very_fast`. The default is `brisk`, and unrecognized values fall back to
+`brisk`. Restart the backend after changing it; new web and phone sessions use
+the same pace instructions. Chloe is still asked to slow down for contact details,
+dates, and spelling, and to pause for the caller's answer.
+
+This is a model speaking style, not an exact multiplier or words-per-minute
+guarantee. GPT Live's documented audio settings expose a voice choice but no
+numeric speech-speed setting. The official [prompting guide](https://developers.openai.com/api/docs/guides/live-prompting#personality)
+recommends describing speaking pace in instructions. Browser playback stays at
+1.0x and phone RTP keeps its normal 20 ms cadence, preserving the audio stream.
+
+The saved phone greeting is a recording. To apply a changed pace to it too, run
+`npm run build`, then `node scripts/generate-live-greeting.cjs`, then
+`npm run build` again before deployment. The generator reads the same environment
+setting and shared pace instructions, and records `speakingPace` in the greeting
+metadata. Listen to the generated WAV before deploying a new recording.
+
 ## Build and deploy
 
 Keep these server settings:

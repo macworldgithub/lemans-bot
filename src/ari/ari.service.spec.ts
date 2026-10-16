@@ -94,6 +94,7 @@ describe('AriService phone startup', () => {
       .mockReturnValue({ request } as unknown as AxiosInstance);
     const values: Record<string, string> = {
       OPENAI_API_KEY: 'test-key',
+      OPENAI_LIVE_SPEAKING_PACE: 'fast',
       ASTERISK_ARI_APP: 'lemans-bot',
     };
     const config = {
@@ -140,6 +141,25 @@ describe('AriService phone startup', () => {
     );
     return ws;
   }
+
+  it('uses the configured speaking pace in phone generation without changing the codec rate', async () => {
+    jest.useFakeTimers();
+    try {
+      await api.handleStasisStart({ channel: { id: 'phone' } });
+      const ws = ready();
+      const start = ws.send.mock.calls
+        .map(([raw]) => JSON.parse(raw))
+        .find((event) => event.type === 'session.start');
+      expect(start.session.instructions).toContain('Speaking pace: fast.');
+      expect(start.session.audio.format).toEqual({
+        type: 'audio/pcmu',
+        rate: 8000,
+      });
+      expect(start.session.audio.output).not.toHaveProperty('speed');
+    } finally {
+      await stopWithFakeTimers();
+    }
+  });
   function blockBridge() {
     const bridge = deferred<{ data: object }>();
     const normal = request.getMockImplementation()!;

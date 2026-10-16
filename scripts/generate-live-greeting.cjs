@@ -3,10 +3,13 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const WebSocket = require('ws');
+// Build first so synthesis uses the same pace instructions as both live paths.
+const { getLiveSpeakingPace } = require('../dist/voice/live-speaking-pace');
 if (fs.existsSync('.env')) process.loadEnvFile('.env');
 const text =
   "Hi, you've reached Le Mans Entertainment. I'm Chloe. How can I help you today?";
 const voice = process.env.OPENAI_LIVE_VOICE || 'quartz';
+const pace = getLiveSpeakingPace(process.env.OPENAI_LIVE_SPEAKING_PACE);
 if (!process.env.OPENAI_API_KEY) throw new Error('OPENAI_API_KEY is required');
 const directory = path.resolve(__dirname, '../src/ari/assets');
 const chunks = [];
@@ -119,6 +122,7 @@ function finish(error) {
         transcript,
         model: 'gpt-live-1',
         voice,
+        speakingPace: pace.name,
         sampleRate: 8000,
         encoding: 'mulaw',
         durationMs: phone.length / 8,
@@ -132,6 +136,7 @@ function finish(error) {
     JSON.stringify({
       status: 'generated',
       voice,
+      speakingPace: pace.name,
       durationMs: phone.length / 8,
       transcript,
     }),
@@ -144,7 +149,8 @@ ws.on('open', () =>
       session: {
         model: 'gpt-live-1',
         instructions:
-          'You are Chloe, a warm Australian receptionist. This is a recording session. Say only the exact requested greeting once. Do not add words, rephrase, or speak again afterward.',
+          'You are Chloe, a warm Australian receptionist. This is a recording session. Say only the exact requested greeting once. Do not add words, rephrase, or speak again afterward. ' +
+          pace.instructions,
         input: [
           {
             type: 'message',

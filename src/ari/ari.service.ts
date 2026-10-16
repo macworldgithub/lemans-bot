@@ -16,6 +16,7 @@ import { AriWebSocketGateway } from './ari-websocket.gateway';
 import { PHONE_STARTUP_AUDIO_SECONDS } from '../voice/sandwich.service';
 import { LivePhoneInput } from './live-phone-input';
 import { LIVE_GREETING_TEXT, loadLiveGreeting } from './live-greeting';
+import { getLiveSpeakingPace } from '../voice/live-speaking-pace';
 
 type AriEvent = {
   type?: string;
@@ -1019,7 +1020,7 @@ export class AriService implements OnModuleInit, OnModuleDestroy {
             type: 'session.start',
             session: {
               model: 'gpt-live-1',
-              instructions: `${instructions}\n\nThe application plays Chloe's saved opening greeting. Do not generate an opening greeting or introduce yourself. Listen first, then respond to the caller. Never repeat the application greeting.`,
+              instructions: `${instructions}\n\nThe application plays Chloe's saved opening greeting. Do not generate an opening greeting or introduce yourself. Listen first, then respond to the caller. Never repeat the application greeting.\n${getLiveSpeakingPace(this.configService.get<string>('OPENAI_LIVE_SPEAKING_PACE')).instructions}`,
               input: [
                 {
                   type: 'message',

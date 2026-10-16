@@ -7,6 +7,7 @@ import WebSocket from 'ws';
 import { LeadCaptureService } from './lead-capture.service';
 import { getEventDateContext, LEMANS_SYSTEM_PROMPT } from './lemans-knowledge';
 import { SandwichService } from './sandwich.service';
+import { getLiveSpeakingPace } from './live-speaking-pace';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -252,7 +253,7 @@ export class VoiceService implements OnModuleDestroy {
             type: 'session.start',
             session: {
               model,
-              instructions: `${this.getSystemPrompt()}\n\nGPT-Live conversation guidance: Speak warmly and concisely in a natural Australian voice. Ask one clear question at a time. For callback, booking, complaint, or other staff follow-up requests, collect the caller’s name and request details, then delegate the task to the application to save the enquiry.`,
+              instructions: `${this.getSystemPrompt()}\n\nGPT-Live conversation guidance: Speak warmly and concisely in a natural Australian voice. Ask one clear question at a time. For callback, booking, complaint, or other staff follow-up requests, collect the caller’s name and request details, then delegate the task to the application to save the enquiry.\n${getLiveSpeakingPace(this.config.get<string>('OPENAI_LIVE_SPEAKING_PACE')).instructions}`,
               audio: {
                 format: { type: 'audio/pcm', rate: 24000 },
                 output: {
