@@ -1,0 +1,20 @@
+# Phone calls on a dev machine: LiveKit SIP + the Redis it shares with the LiveKit server.
+# Started by scripts/livekit.mjs when SIP_ENABLED=true; the config comes from scripts/sip.mjs.
+name: lemans-sip
+
+services:
+  redis:
+    image: redis:7.4-alpine
+    ports:
+      - "127.0.0.1:6379:6379"
+
+  sip:
+    image: livekit/sip:v1.17.0
+    depends_on:
+      - redis
+    environment:
+      SIP_CONFIG_BODY: ${SIP_CONFIG_BODY}
+    ports:
+      - "${SIP_PORT}:${SIP_PORT}/udp"
+      - "${SIP_PORT}:${SIP_PORT}/tcp"
+      - "${SIP_RTP_PORTS}:${SIP_RTP_PORTS}/udp"

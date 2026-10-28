@@ -1,0 +1,46 @@
+@import 'tailwindcss';
+
+@theme {
+  --font-sans: 'Outfit', sans-serif;
+
+  --color-brand: #e11d48;
+  --color-brand-dark: #be123c;
+  --color-ink: #0a0a0a;
+  --color-card: rgba(20, 20, 20, 0.9);
+  --color-line: rgba(255, 255, 255, 0.08);
+  --color-fg: #f8fafc;
+  --color-muted: #71717a;
+  --color-ok: #22c55e;
+  --color-warn: #eab308;
+
+  --animate-ring: ring 2.4s ease-out infinite;
+  --animate-ring-fast: ring 1s ease-out infinite;
+  --animate-blink: blink 1s steps(1) infinite;
+
+  @keyframes ring {
+    0% {
+      transform: scale(1);
+      opacity: 0.7;
+    }
+    100% {
+      transform: scale(1.65);
+      opacity: 0;
+    }
+  }
+  @keyframes blink {
+    50% {
+      opacity: 0;
+    }
+  }
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    min-height: 100%;
+  }
+  body {
+    @apply bg-ink font-sans text-fg antialiased;
+  }
+}

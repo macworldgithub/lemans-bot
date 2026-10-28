@@ -1,0 +1,16 @@
+LeMans Entertainment — AI Receptionist Knowledge Base,
+Built 29 Sep 2026 from official site FAQs + Vonex call-archive metadata in the shared Drive folder. Prices and hours must be confirmed by LeMans before go-live.,
+,
+Sheet,Purpose
+Business profile,"Identity, phones, emails, address, hours, booking office, after-hours rules"
+Transfer rules,Who the agent transfers to by intent. Fill Dest number / name before launch
+Intents & answers,Primary RAG / prompt table: caller intent → spoken answer → action
+Activities & ages,"Age, height, medical and capacity rules per activity"
+Packages & prices,Published package prices. Flagged as confirm-before-quote
+Booking & payments,"Deposits, refunds, reschedules, waivers, catering, BYO"
+Call archive index,Parsed Vonex WAV filenames from sampled days in the source folder
+Open questions,Facts the recordings/site do not settle — staff must complete
+,
+Source folder,https://drive.google.com/drive/folders/1QFzMwOBlC_mVF43mvI2XM3Nvh11u8463
+What that folder actually contains,"181 daily folders (2026-04-02 to 2026-09-29) of Vonex WAV call recordings for (03) 8787 8741 and (03) 8797 1458. Not documents. This sheet is the structured knowledge base the receptionist should use; the WAVs are raw training audio, not answers."
+Hours conflict to resolve,Homepage Friday hours 10:15am–9:00pm vs Contact page Friday 12:15pm–9:00pm. Use homepage values in Business profile until staff confirm.

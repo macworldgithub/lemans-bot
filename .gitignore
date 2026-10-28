@@ -54,3 +54,25 @@ pids
 
 # Diagnostic reports (https://nodejs.org/api/report.html)
 report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
+
+# Speaker-lock models (auto-downloaded on first start)
+/models
+
+# Old implementation (kept locally for reference)
+/archive/node_modules
+/archive/dist
+/archive/models
+
+# Browser test screenshots
+/.playwright-mcp
+
+# Local LiveKit binaries + research scratch
+/tools
+/.research
+
+# env backups
+.env.bak*
+
+# Local logs
+/logs
+/node_modules

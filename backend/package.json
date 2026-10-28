@@ -1,0 +1,48 @@
+{
+  "name": "lemans-voice-backend",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@livekit/agents": "^1.9.4",
+    "@livekit/agents-plugin-deepgram": "^1.9.4",
+    "@livekit/agents-plugin-elevenlabs": "^1.9.4",
+    "@livekit/agents-plugin-livekit": "^1.9.4",
+    "@livekit/agents-plugin-openai": "^1.9.4",
+    "@livekit/agents-plugin-silero": "^1.9.4",
+    "@livekit/protocol": "^1.53.0",
+    "@livekit/rtc-node": "^1.2.1",
+    "csv-parse": "^7.0.3",
+    "dotenv": "^18.0.9",
+    "express": "^5.3.0",
+    "livekit-server-sdk": "^2.19.2",
+    "mongodb": "^7.7.0",
+    "pino": "^10.4.0",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^26.6.5",
+    "@types/supertest": "^7.2.1",
+    "pino-pretty": "^13.2.0",
+    "supertest": "^7.3.1",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.5"
+  },
+  "scripts": {
+    "dev:api": "tsx watch src/api/index.ts",
+    "dev:agent": "tsx src/agent/worker.ts dev",
+    "start:api": "node dist/api/index.js",
+    "start:agent": "node dist/agent/worker.js start",
+    "download-files": "livekit-agents download-files",
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --exclude \"test/agent/**\"",
+    "test:agent": "vitest run test/agent",
+    "bench:llm": "tsx scripts/bench-llm.ts"
+  }
+}

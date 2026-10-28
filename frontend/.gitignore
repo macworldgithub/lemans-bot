@@ -1,0 +1,6 @@
+node_modules
+dist
+*.local
+/e2e/fixtures/*.wav
+/test-results
+/playwright-report
