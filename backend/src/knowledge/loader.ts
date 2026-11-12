@@ -23,10 +23,18 @@ export const SHEETS: SheetSpec[] = [
   { file: 'business-profile.csv', title: 'Business profile', omit: ['Source'] },
   { file: 'intents-and-answers.csv', title: 'Intents and approved answers' },
   { file: 'packages-and-prices.csv', title: 'Packages and published prices' },
-  { file: 'activities-and-ages.csv', title: 'Activity rules (ages, limits, medical)' },
+  {
+    file: 'activities-and-ages.csv',
+    title: 'Activity rules (ages, limits, medical)',
+    omit: ['Source', 'Review date'],
+  },
   { file: 'booking-and-payments.csv', title: 'Booking, payment, waiver and catering rules' },
   { file: 'transfer-rules.csv', title: 'Transfer and escalation rules', omit: ['Destination number'] },
-  { file: 'open-questions.csv', title: 'Unconfirmed facts (do not state these as fact)', omit: ['Owner'] },
+  {
+    file: 'open-questions.csv',
+    title: 'Unconfirmed facts (do not state these as fact)',
+    omit: ['Owner', 'Why it matters'],
+  },
 ];
 
 const cell = (v: unknown) => String(v ?? '').replace(/\s+/g, ' ').trim();
@@ -45,7 +53,17 @@ export function parseSheet(csv: string, spec: SheetSpec): Sheet {
   const data = rows
     .slice(headerIdx + 1)
     .filter((r) => r.filter(Boolean).length >= 2)
-    .map((r) => Object.fromEntries(headers.map((h, i) => [h, r[i] ?? ''])));
+    .map((r) => Object.fromEntries(headers.map((h, i) => [h, r[i] ?? ''])))
+    .filter((row) => {
+      // Filter out any row with an explicit unapproved status
+      const approval = row['Approval status'] || row['Status'];
+      if (approval && (approval === 'Unapproved' || approval === 'Draft' || approval === 'Unconfirmed')) {
+        // Open questions has unconfirmed facts that are explicitly labeled
+        if (spec.file === 'open-questions.csv') return true;
+        return false;
+      }
+      return true;
+    });
 
   return { file: spec.file, title: spec.title, headers, rows: data };
 }

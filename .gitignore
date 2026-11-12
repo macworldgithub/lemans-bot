@@ -76,3 +76,6 @@ report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
 # Local logs
 /logs
 /node_modules
+
+# Agents
+.agents

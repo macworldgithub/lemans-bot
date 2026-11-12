@@ -1,12 +1,16 @@
-Staff must complete before the agent goes live,,,,
 ID,Question,Why it matters,Owner,Answer
-Q1,Correct Friday venue hours — 10:15am or 12:15pm start?,Homepage and contact page disagree.,LeMans,
-Q2,"Warm-transfer numbers for Reservations, Corporate sales, Duty manager",POC requires live transfer. Yellow cells on Transfer rules.,LeMans,
-Q3,What is extension 300 / 301 / 503 / 508 on Vonex?,Recordings show these as internal endpoints.,LeMans / Vonex,
-Q4,"Is (03) 8797 1458 a second public number, paintball, or overflow?",Second DID in the archive.,LeMans,
-Q5,Current official rate card vs website prices,Agent must not over-promise.,LeMans,
-Q6,ActiveCampaign list ID + tag names for KidsParty / BucksHens / Corporate / AfterHours,Fallback when transfer fails.,OmniSuite / LeMans,
-Q7,After-hours callback SLA,Set caller expectation.,LeMans,
-Q8,Public holiday hours and school-holiday mid-week deal exclusions for 2026–27,Deals copy excludes those days.,LeMans,
-Q9,Should the agent mention paintball as a current product?,Directories still list paintball at 57 Waterview Close; main site pushes karts/VR/laser/golf.,LeMans,
-Q10,Preferred greeting name ('LeMans' vs 'Le Mans Entertainment') and hold music / transfer phrase,Brand consistency.,LeMans,
+Q1,Correct Friday venue hours — 10:15am or 12:15pm start?,Homepage and contact page disagree.,LeMans,Unconfirmed
+Q2,"Warm-transfer numbers for Reservations, Corporate sales, Duty manager",POC requires live transfer destinations.,LeMans,Unconfirmed
+Q3,What is extension 300 / 301 / 503 / 508 on Vonex?,Recordings show these as internal endpoints.,LeMans / Vonex,Unconfirmed
+Q4,"Is (03) 8797 1458 a second public number, paintball, or overflow?",Second DID in the archive.,LeMans,Unconfirmed
+Q5,Current official rate card vs website prices,Agent must not over-promise.,LeMans,Unconfirmed
+Q6,ActiveCampaign list ID + tag names for event callbacks,Fallback when transfer fails.,OmniSuite / LeMans,Unconfirmed
+Q7,After-hours callback SLA,Set caller expectation.,LeMans,Unconfirmed
+Q8,Public holiday hours and school-holiday mid-week deal exclusions for 2026–27,Deals copy excludes those days.,LeMans,Unconfirmed
+Q9,Should the agent mention paintball as a current product?,Directories still list paintball at 57 Waterview Close.,LeMans,Unconfirmed
+Q10,Gate G1: Events routing policy (immediate handoff vs 40-person threshold),Staff business rule decision.,LeMans,Unconfirmed
+Q11,Gate G2: Staff telephony destinations and warm transfer capability,Carrier / PBX configuration required.,LeMans / Carrier,Unconfirmed
+Q12,Gate G3: SMS provider selection and approved sender ID,Required for live outbound text messages.,LeMans / Provider,Unconfirmed
+Q13,Gate G4: Google Sheets hours spreadsheet ID and service account,Required for dynamic hours sync.,LeMans,Unconfirmed
+Q14,Gate G5: Final approved menu and activity eligibility rules,Content approval needed.,LeMans,Unconfirmed
+Q15,Gate G7: Production staff access control for calls and leads API,Security and privacy requirement.,LeMans / Ops,Unconfirmed

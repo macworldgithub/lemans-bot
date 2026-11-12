@@ -19,6 +19,7 @@ export interface TranscriptEvent {
 
 export interface LeadInfo {
   callId: string;
+  operationId?: string;
   name: string;
   phone?: string;
   email?: string;
@@ -34,7 +35,15 @@ export interface TransferInfo {
   department: Department;
   reason: string;
   target?: string;
-  status: 'transferring' | 'unavailable' | 'failed';
+  status:
+    | 'requested'
+    | 'transferring'
+    | 'transferred'
+    | 'web-demo'
+    | 'simulated'
+    | 'unavailable'
+    | 'failed'
+    | 'unknown';
   ts: number;
 }
 

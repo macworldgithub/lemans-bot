@@ -25,6 +25,8 @@ describe('GPT-Live instructions', () => {
     expect(backend).toMatch(/transfer_call/);
     expect(backend).toMatch(/save_lead/);
     expect(backend).toMatch(/end_call/);
+    expect(backend).toMatch(/lookup_hours/);
+    expect(voice).toMatch(/Delegate every date-sensitive hours question/);
   });
 });
 
@@ -34,11 +36,11 @@ describe('closing judge', () => {
   const reply = (content: string) =>
     vi.fn(async () => new Response(JSON.stringify({ choices: [{ message: { content } }] }), { status: 200 }));
 
-  it('treats a goodbye from Chloe as the end without asking the model', async () => {
+  it('does not treat a goodbye word alone as authority to hang up', async () => {
     const fetch = reply('NO');
     vi.stubGlobal('fetch', fetch);
-    expect(await createClosingJudge('key')("That's all, thanks", 'No worries, bye!')).toBe(true);
-    expect(fetch).not.toHaveBeenCalled();
+    expect(await createClosingJudge('key')("That's all, thanks", 'No worries, bye!')).toBe(false);
+    expect(fetch).toHaveBeenCalledOnce();
   });
 
   it('does not end on a goodbye that asks a question', async () => {

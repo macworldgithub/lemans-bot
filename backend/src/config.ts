@@ -21,11 +21,23 @@ const phoneNumber = optional.transform((v) => {
   return cleaned && /^\+?[0-9 ]{6,}$/.test(cleaned) ? cleaned.replace(/\s+/g, '') : undefined;
 });
 
+const booleanFlag = z
+  .union([z.boolean(), z.string()])
+  .optional()
+  .transform((v) => {
+    if (typeof v === 'boolean') return v;
+    if (!v) return false;
+    const lower = v.trim().toLowerCase();
+    return lower === 'true' || lower === '1' || lower === 'yes';
+  });
+
 const schema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   PORT: z.coerce.number().int().positive().default(3010),
+  API_HOST: z.string().default('127.0.0.1'),
   API_URL: z.string().url().default('http://127.0.0.1:3010'),
   INTERNAL_API_SECRET: z.string().min(16),
+  STAFF_API_KEY: optional,
   CORS_ORIGIN: optional,
 
   LIVEKIT_URL: z.string().url(),
@@ -56,12 +68,38 @@ const schema = z.object({
   MONGO_DB: z.string().default('lemans_voice'),
   TIMEZONE: z.string().default('Australia/Melbourne'),
 
+  // Dynamic hours settings
+  HOURS_ENABLED: booleanFlag,
+  HOURS_SHEET_ID: optional,
+  HOURS_SHEET_RANGE: z.string().default('A:F'),
+  HOURS_REFRESH_SECONDS: z.coerce.number().int().positive().default(300),
+  HOURS_MAX_AGE_SECONDS: z.coerce.number().int().positive().default(900),
+  GOOGLE_APPLICATION_CREDENTIALS: optional,
+
+  // SMS messaging settings
+  SMS_ENABLED: booleanFlag,
+  SMS_PROVIDER: z.enum(['fake', 'twilio']).default('fake'),
+  BOOKING_LINK_URL: z.string().url().default('https://www.lemansgokarts.com.au'),
+  MAPS_LINK_URL: z.string().url().default('https://maps.google.com/?q=11-55+Waterview+Close+Dandenong+South+VIC+3175'),
+  SMS_DAILY_LIMIT: z.coerce.number().int().positive().default(50),
+  SMS_RECIPIENT_COOLDOWN_SECONDS: z.coerce.number().int().positive().default(60),
+  // Keyed fingerprint for recipient rate-limit keys. Keep it out of logs.
+  SMS_HMAC_SECRET: optional,
+  // Generic HMAC secret for the fake provider callback. Replace with the selected
+  // provider's signature verification when G3 chooses a provider.
+  SMS_WEBHOOK_SECRET: optional,
+  TWILIO_ACCOUNT_SID: optional,
+  TWILIO_AUTH_TOKEN: optional,
+  TWILIO_FROM_NUMBER: optional,
+
   // Transfer targets. Phone calls are REFERred here; unset = take a lead instead.
   TRANSFER_RESERVATIONS: phoneNumber,
   TRANSFER_CORPORATE: phoneNumber,
   TRANSFER_DUTY_MANAGER: phoneNumber,
   TRANSFER_MAIN: phoneNumber,
   TRANSFER_CORPORATE_LARGE: phoneNumber,
+  // Extra entry numbers or return-to-agent routes that must never be transfer targets.
+  AGENT_ENTRY_NUMBERS: optional,
 });
 
 export type Config = z.infer<typeof schema>;

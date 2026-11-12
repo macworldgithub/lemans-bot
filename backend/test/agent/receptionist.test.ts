@@ -39,6 +39,9 @@ class FakeServices implements CallServices {
   async endCall(goodbye: string) {
     this.goodbye = goodbye;
   }
+  async lookupHours() {
+    return { status: 'current' as const, date: '2026-10-24', schedule: 'venue', closed: false, opens: '09:15', closes: '23:00' };
+  }
 }
 
 let session: voice.AgentSession<CallUserData> | undefined;
@@ -59,7 +62,7 @@ afterEach(async () => {
 });
 
 describe('LeMans receptionist', { timeout: 120_000 }, () => {
-  it('gives the opening hours from the knowledge base', async () => {
+  it('gives opening hours from the hours service', async () => {
     const { session } = await start();
     const result = await session.run({ userInput: 'What time are you open on Saturday?' }).wait();
     await result.expect.nextEvent().isMessage({ role: 'assistant' }).judge(judge, {

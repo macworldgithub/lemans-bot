@@ -47,6 +47,21 @@ export class EventReporter {
     return this.chain;
   }
 
+  /** A repeated completion reuses stored send operations. Never report a failed request as success. */
+  async completeMessages(callId: string, reason: 'caller_disconnected' | 'room_deleted', draftId?: string): Promise<void> {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const response = await fetch(`${this.apiUrl}/internal/messages/calls/${encodeURIComponent(callId)}/complete`, {
+          method: 'POST', headers: { 'content-type': 'application/json', 'x-internal-secret': this.secret },
+          body: JSON.stringify({ reason, draftId }), signal: AbortSignal.timeout(15_000),
+        });
+        if (response.ok) return;
+        if (response.status < 500) break;
+      } catch { /* Repeat the completion request, never a provider request. */ }
+    }
+    throw new Error('After-call SMS dispatch was not confirmed');
+  }
+
   private async post(event: AgentEvent): Promise<void> {
     try {
       const res = await fetch(`${this.apiUrl}/internal/events`, {
