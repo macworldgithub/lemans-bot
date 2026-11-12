@@ -1,4 +1,4 @@
-import { voice } from '@livekit/agents';
+import { log, voice } from '@livekit/agents';
 
 import { GREETING } from './prompt.js';
 import type { CallState } from './state.js';
@@ -26,13 +26,14 @@ export function takeSmsConsent(state: CallState, run: voice.RunContext<CallUserD
  * generate: speech-to-speech models have no separate TTS, so the model speaks it.
  * none: text-only tests.
  */
-const GREETING_ATTEMPTS = 3;
-const GREETING_RETRY_MS = 4_000;
+const GREETING_ATTEMPTS = 2;
 
 export type GreetingMode = 'say' | 'generate' | 'none';
 
 export class Receptionist extends voice.Agent<CallUserData> {
-  private greetingTimer?: ReturnType<typeof setTimeout>;
+  private greetingRequested = false;
+  private greetingExited = false;
+  private stopGreetingWatch?: () => void;
 
   constructor(instructions: string, private readonly greeting: GreetingMode = 'say', private readonly afterCallSms = false) {
     super({
@@ -66,41 +67,49 @@ export class Receptionist extends voice.Agent<CallUserData> {
   }
 
   override async onEnter(): Promise<void> {
+    if (this.greetingRequested) return;
+    this.greetingRequested = true;
     if (this.greeting === 'say') this.session.say(GREETING);
-    else if (this.greeting === 'generate') this.greet();
+    else if (this.greeting === 'generate') void this.greet().catch(() => {
+      log().warn({ code: 'greeting_failed' }, 'Greeting could not be completed');
+    });
   }
 
   override async onExit(): Promise<void> {
-    // A retry timer must not outlive the agent that owns it.
-    this.clearGreetingTimer();
+    this.greetingExited = true;
+    this.stopGreetingWatch?.();
   }
 
   /**
-   * A speech-to-speech model treats the request as a suggestion and now and then stays silent
-   * (seen with GPT-Live). A caller must never pick up to silence, so ask again until it speaks.
+   * A full-duplex model may take several seconds to accept a greeting request.
+   * Wait for that request to finish before considering a retry. Never queue a
+   * second greeting once the caller or agent has started the conversation.
    */
-  private greet(attempt = 1): void {
-    this.clearGreetingTimer();
+  private async greet(): Promise<void> {
+    const session = this.session;
+    let conversationStarted = session.agentState === 'speaking' || session.userState === 'speaking' ||
+      session.history.items.some(item => item.type === 'message' && (item.role === 'user' || item.role === 'assistant'));
+    const onUser = (event: voice.UserStateChangedEvent) => {
+      if (event.newState === 'speaking') conversationStarted = true;
+    };
+    const onAgent = (event: voice.AgentStateChangedEvent) => {
+      if (event.newState === 'speaking') conversationStarted = true;
+    };
+    const cleanup = () => {
+      session.off(voice.AgentSessionEventTypes.UserStateChanged, onUser);
+      session.off(voice.AgentSessionEventTypes.AgentStateChanged, onAgent);
+      this.stopGreetingWatch = undefined;
+    };
+    this.stopGreetingWatch = cleanup;
+    session.on(voice.AgentSessionEventTypes.UserStateChanged, onUser);
+    session.on(voice.AgentSessionEventTypes.AgentStateChanged, onAgent);
     try {
-      this.session.generateReply({ instructions: `Greet the caller with: "${GREETING}"` });
-    } catch {
-      return; // session already closed (caller hung up)
-    }
-    if (attempt >= GREETING_ATTEMPTS) return;
-    this.greetingTimer = setTimeout(() => {
-      this.greetingTimer = undefined;
-      const started =
-        this.session.agentState === 'speaking' ||
-        this.session.userState === 'speaking' ||
-        this.session.history.items.some((i) => i.type === 'message');
-      if (!started) this.greet(attempt + 1);
-    }, GREETING_RETRY_MS);
-  }
-
-  private clearGreetingTimer(): void {
-    if (this.greetingTimer !== undefined) {
-      clearTimeout(this.greetingTimer);
-      this.greetingTimer = undefined;
-    }
+      for (let attempt = 0; attempt < GREETING_ATTEMPTS; attempt++) {
+        if (this.greetingExited || conversationStarted) return;
+        const speech = session.generateReply({ instructions: `Greet the caller once with: "${GREETING}" Do not repeat a greeting already spoken.` });
+        try { await speech.waitForPlayout(); } catch { /* Check the handle's actual result below. */ }
+        if (!speech.exception() || speech.interrupted) return;
+      }
+    } finally { cleanup(); }
   }
 }

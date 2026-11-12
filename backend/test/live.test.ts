@@ -28,6 +28,16 @@ describe('GPT-Live instructions', () => {
     expect(backend).toMatch(/lookup_hours/);
     expect(voice).toMatch(/Delegate every date-sensitive hours question/);
   });
+
+  it('answers known event information before referring the caller elsewhere', () => {
+    for (const instructions of [voice, backend]) {
+      expect(instructions).toContain("Answer the caller's factual question first");
+      expect(instructions).toContain('A website or transfer offer is not a substitute');
+      expect(instructions).not.toContain("I'm not sure about that. I can help you find the website.");
+    }
+    expect(voice).toContain('Greet once.');
+    expect(voice).toContain('expand on the option the caller chooses');
+  });
 });
 
 describe('closing judge', () => {

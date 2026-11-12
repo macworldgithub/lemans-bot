@@ -16,13 +16,13 @@ import { buildSessionOptions } from './pipeline.js';
 import { buildInstructions, buildLiveInstructions } from './prompt.js';
 import { Receptionist, takeSmsConsent } from './receptionist.js';
 import { EventReporter } from './reporter.js';
-import { ResponseGuard } from './response-guard.js';
+import { bindResponseGuard, ResponseGuard } from './response-guard.js';
 import { aiMayCloseRoom, createCallState, recordCallerTurn, setCallOwnership } from './state.js';
 import { resolveTransferTarget, toTelUri } from './transfer.js';
 import type { CallServices, CallUserData } from './tools.js';
 
-/** Short, truthful recovery. Staff/message options wait for the approved gates. */
-const RECOVERY_TEXT = "I'm not sure about that. I can help you find the website.";
+/** A slow answer is not evidence that information is unknown. */
+const WAITING_TEXT = 'One moment while I check that.';
 
 const httpUrl = config.LIVEKIT_URL.replace(/^ws/, 'http');
 const rooms = new RoomServiceClient(httpUrl, config.LIVEKIT_API_KEY, config.LIVEKIT_API_SECRET);
@@ -94,17 +94,17 @@ export default defineAgent({
       callerParticipantId: caller.identity,
     });
 
-    // One recovery per caller turn. The guard owns the deadline so a late answer
-    // cannot speak over the recovery or start a second one.
+    // GPT-Live owns its speech turns. Observe slow replies without interrupting
+    // or injecting another reply. Other pipelines can give one waiting cue.
     const responseGuard = new ResponseGuard({
+      mode: live ? 'observe' : 'recover',
+      onSlow: (_turnId, elapsedMs) => {
+        logger.warn({ thresholdMs: 3000, elapsedMs }, 'response target exceeded');
+      },
       onRecovery: async () => {
-        try {
-          session.interrupt();
-        } catch {
-          // The session may already be closed.
-        }
-        logger.info({ thresholdMs: 3000 }, 'turn recovery spoken');
-        await speak(RECOVERY_TEXT)
+        if (session.agentState === 'speaking' || session.userState === 'speaking') return;
+        logger.info({ thresholdMs: 3000 }, 'waiting cue requested');
+        await speak(WAITING_TEXT)
           .waitForPlayout()
           .catch((err: Error) => logger.warn({ err: err.message }, 'recovery not spoken'));
       },
@@ -341,6 +341,7 @@ export default defineAgent({
         liveInstructions && { backendInstructions: liveInstructions.backend, vad: ctx.proc.userData.vad as VAD },
       ),
     );
+    bindResponseGuard(session, responseGuard);
 
     // ── live transcript ──────────────────────────────────────────────
     // User lines stream as interim text, then the committed conversation item closes them.
@@ -353,11 +354,9 @@ export default defineAgent({
     let callerStoppedAt: number | undefined;
     let responseMs: number | undefined;
     session.on(voice.AgentSessionEventTypes.UserStateChanged, (ev) => {
-      if (ev.newState === 'speaking') responseGuard.cancel(); // barge-in
       if (ev.oldState === 'speaking' && ev.newState === 'listening') callerStoppedAt = ev.createdAt;
     });
     session.on(voice.AgentSessionEventTypes.AgentStateChanged, (ev) => {
-      if (ev.newState === 'speaking') responseGuard.answerStarted(responseGuard.activeTurnId);
       if (ev.newState !== 'speaking' || callerStoppedAt === undefined) return;
       responseMs = Math.round(ev.createdAt - callerStoppedAt);
       callerStoppedAt = undefined;
@@ -380,11 +379,10 @@ export default defineAgent({
         lastCallerLine = userTurnText;
         userFinals = '';
         recordCallerTurn(state, item.id);
-        // A new caller turn starts a new recovery deadline. It also makes any
-        // pending closing decision stale.
+        // Transcript items update request provenance and closing state. Audio
+        // events own response timing; late fragments must not request more speech.
         callConcluded = false;
         clearTimeout(goodbyeTimer);
-        responseGuard.beginTurn(item.id);
         send({ id: `u${userTurn}`, role: 'user', kind: 'final', text: userTurnText });
       } else if (item.role === 'assistant') {
         if (userTurnText) {
@@ -487,7 +485,7 @@ export default defineAgent({
 
     session.on(voice.AgentSessionEventTypes.Error, (ev) => {
       logger.error({ err: String(ev.error) }, 'session error');
-      // A model/provider failure is a true unknown result: recover at once, once.
+      // Live mode records this failure without injecting another model reply.
       responseGuard.failCurrent();
     });
 

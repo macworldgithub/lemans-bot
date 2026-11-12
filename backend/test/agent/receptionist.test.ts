@@ -62,6 +62,25 @@ afterEach(async () => {
 });
 
 describe('LeMans receptionist', { timeout: 120_000 }, () => {
+  it('explains approved party inclusions before offering a website or transfer', async () => {
+    const { session, services } = await start();
+    const result = await session.run({ userInput: 'I only want information, not to book yet. What does a kids birthday party include?' }).wait();
+    await result.expect.containsMessage({ role: 'assistant' }).judge(judge, {
+      intent: 'Answers with concrete approved party inclusions, such as karting, food, a drink, a party host or party space. Does not merely offer a website or transfer instead of answering. Does not claim a booking or live availability.',
+    });
+    expect(services.transfers).toHaveLength(0);
+  });
+
+  it('keeps answering package follow-up questions with useful facts', async () => {
+    const { session, services } = await start();
+    await session.run({ userInput: 'I am just comparing birthday options. Can children do both go-karts and laser tag?' }).wait();
+    const result = await session.run({ userInput: 'Please explain what the combined package includes. I want the details now, not a booking or a website.' }).wait();
+    await result.expect.containsMessage({ role: 'assistant' }).judge(judge, {
+      intent: 'Gives concrete information about the combined karting and laser tag party package, including both activities and at least one other inclusion. Does not replace the answer with only a website or transfer offer. Does not claim a booking or live availability.',
+    });
+    expect(services.transfers).toHaveLength(0);
+  });
+
   it('gives opening hours from the hours service', async () => {
     const { session } = await start();
     const result = await session.run({ userInput: 'What time are you open on Saturday?' }).wait();

@@ -1,18 +1,47 @@
 /**
  * Owns the per-turn recovery deadline.
  *
- * The 3-second value is a target for audible recovery, not a provider guarantee.
- * The worker measures from the committed caller turn to the start of useful audio.
- * A timer only decides when to speak the recovery. It never starts a transfer,
- * saves a lead, or sends a message.
+ * The 3-second value is a response target, not a provider guarantee.
+ * The worker measures from the end of caller audio to the start of useful audio.
+ * Full-duplex speech only records delays. Other modes can give one waiting cue.
+ * The timer never starts a transfer, saves a lead, or sends a message.
  */
+
+import { voice } from '@livekit/agents';
 
 export const DEFAULT_RECOVERY_MS = 3_000;
 
-export type ResponseGuardTurnState = 'waiting' | 'answered' | 'recovering' | 'cancelled';
+/** Wire runtime events separately so their ordering can be tested with the SDK emitter. */
+export function bindResponseGuard<UserData>(session: voice.AgentSession<UserData>, guard: ResponseGuard): () => void {
+  let utterance = 0;
+  const onUser = (event: voice.UserStateChangedEvent) => {
+    if (event.newState === 'speaking') guard.cancel();
+    if (event.oldState === 'speaking' && event.newState === 'listening' && session.agentState !== 'speaking') {
+      guard.beginTurn(`audio-${++utterance}`);
+    }
+  };
+  const onAgent = (event: voice.AgentStateChangedEvent) => {
+    if (event.newState === 'speaking') guard.answerStarted(guard.activeTurnId);
+  };
+  const cleanup = () => {
+    guard.close();
+    session.off(voice.AgentSessionEventTypes.UserStateChanged, onUser);
+    session.off(voice.AgentSessionEventTypes.AgentStateChanged, onAgent);
+    session.off(voice.AgentSessionEventTypes.Close, cleanup);
+  };
+  session.on(voice.AgentSessionEventTypes.UserStateChanged, onUser);
+  session.on(voice.AgentSessionEventTypes.AgentStateChanged, onAgent);
+  session.on(voice.AgentSessionEventTypes.Close, cleanup);
+  return cleanup;
+}
+
+export type ResponseGuardTurnState = 'waiting' | 'slow' | 'answered' | 'recovering' | 'cancelled';
 
 export interface ResponseGuardOptions {
-  /** Target time from a committed caller turn to recovery audio. */
+  /** Full-duplex models own their speech. Observe a delay without injecting a new reply. */
+  mode?: 'recover' | 'observe';
+  onSlow?: (turnId: string, elapsedMs: number) => void | Promise<void>;
+  /** Target time from the end of caller audio to an answer. */
   timeoutMs?: number;
   /** Called at most once per turn, only when no useful answer has started. */
   onRecovery: (turnId: string, elapsedMs: number) => void | Promise<void>;
@@ -39,7 +68,7 @@ export class ResponseGuard {
     this.now = options.now ?? (() => Date.now());
   }
 
-  /** Start a deadline for a new committed caller turn and cancel the old one. */
+  /** Start a deadline for a new caller utterance and cancel the old one. */
   beginTurn(turnId: string): boolean {
     if (this.closed) return false;
     this.cancel();
@@ -59,7 +88,7 @@ export class ResponseGuard {
    */
   answerStarted(turnId?: string): boolean {
     const turn = this.activeTurn;
-    if (!turn || turn.state !== 'waiting') return false;
+    if (!turn || (turn.state !== 'waiting' && turn.state !== 'slow')) return false;
     if (turnId !== undefined && turn.id !== turnId) return false;
     this.clearTimer(turn);
     turn.state = 'answered';
@@ -108,11 +137,13 @@ export class ResponseGuard {
 
   private fireRecovery(turn: ActiveTurn): void {
     if (turn.state !== 'waiting') return;
-    turn.state = 'recovering';
+    const observe = this.options.mode === 'observe';
+    turn.state = observe ? 'slow' : 'recovering';
     this.clearTimer(turn);
     const elapsedMs = this.now() - turn.startedAt;
     try {
-      const result = this.options.onRecovery(turn.id, elapsedMs);
+      const callback = observe ? this.options.onSlow : this.options.onRecovery;
+      const result = callback?.(turn.id, elapsedMs);
       if (result && typeof (result as Promise<void>).then === 'function') {
         (result as Promise<void>).catch((error) => this.options.onError?.(error));
       }
